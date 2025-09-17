@@ -1,0 +1,7 @@
+torch
+numpy
+folder_paths
+re
+comfy.utils
+mediapipe
+ultralytics
