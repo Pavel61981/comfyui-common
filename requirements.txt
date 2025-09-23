@@ -5,3 +5,4 @@ re
 comfy.utils
 mediapipe
 ultralytics
+opencv-contrib-python
