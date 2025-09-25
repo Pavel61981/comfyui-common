@@ -1,8 +1,6 @@
 torch
 numpy
-folder_paths
-re
-comfy.utils
 mediapipe
 ultralytics
 opencv-contrib-python
+Pillow

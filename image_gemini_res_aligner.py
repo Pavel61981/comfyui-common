@@ -12,7 +12,8 @@ try:
 except Exception:
     comfy_utils = None
 
-class ImageGeminiResolutionAligner:
+
+class ImageScaleForGemini:
     CATEGORY = "Image/Transform"
     DESCRIPTION = "Автоматическое приведение изображения к ближайшему стандартному соотношению сторон (Gemini/SDXL-подход)."
 
@@ -24,19 +25,23 @@ class ImageGeminiResolutionAligner:
                 "upscaler": (["auto", "bicubic", "area", "bilinear", "nearest"],),
                 "resize_mode": (["Scale and Crop to Fill", "Scale to Fit"],),
                 "preserve_original_size": ("BOOLEAN", {"default": True}),
-                "side": ([
-                    "по середине",
-                    "сверху",
-                    "снизу",
-                    "слева",
-                    "справа"
-                ], {"default": "по середине"}),
+                "side": (
+                    ["по середине", "сверху", "снизу", "слева", "справа"],
+                    {"default": "по середине"},
+                ),
             }
         }
 
     # Возвращаем: исходное изображение, оригинальные размеры, обработанное изображение, новые размеры
     RETURN_TYPES = ("IMAGE", "INT", "INT", "IMAGE", "INT", "INT")
-    RETURN_NAMES = ("original_image", "original_width", "original_height", "new_image", "new_width", "new_height")
+    RETURN_NAMES = (
+        "original_image",
+        "original_width",
+        "original_height",
+        "new_image",
+        "new_width",
+        "new_height",
+    )
     FUNCTION = "process"
 
     # Предустановленные целевые соотношения/разрешения (как в ТЗ)
@@ -66,7 +71,9 @@ class ImageGeminiResolutionAligner:
             arr = arr.astype(np.uint8)
         return Image.fromarray(arr)
 
-    def _tensor_from_pil(self, pil_img: Image.Image, dtype=torch.float32) -> torch.Tensor:
+    def _tensor_from_pil(
+        self, pil_img: Image.Image, dtype=torch.float32
+    ) -> torch.Tensor:
         arr = np.array(pil_img)  # H,W,C uint8
         if arr.ndim == 2:
             arr = np.stack([arr, arr, arr], axis=-1)
@@ -103,7 +110,14 @@ class ImageGeminiResolutionAligner:
             return 32
         return max(32, (value // 32) * 32)
 
-    def process(self, image, upscaler="auto", resize_mode="Scale and Crop to Fill", preserve_original_size=True, side="по середине"):
+    def process(
+        self,
+        image,
+        upscaler="auto",
+        resize_mode="Scale and Crop to Fill",
+        preserve_original_size=True,
+        side="по середине",
+    ):
         """
         image: torch.Tensor shape [B, H, W, C] (B - batch)
         upscaler: one of ["auto","bicubic","area","bilinear","nearest"]
@@ -116,7 +130,9 @@ class ImageGeminiResolutionAligner:
             if image is None:
                 raise ValueError("Пустой вход image.")
             if not torch.is_tensor(image):
-                raise TypeError("Вход 'image' должен быть torch.Tensor формата [B,H,W,C].")
+                raise TypeError(
+                    "Вход 'image' должен быть torch.Tensor формата [B,H,W,C]."
+                )
             if image.ndim != 4:
                 raise ValueError("Ожидается входной тензор формы [B,H,W,C].")
             batch_size = image.shape[0]
@@ -129,7 +145,9 @@ class ImageGeminiResolutionAligner:
             traceback.print_exc()
             return (image, 0, 0, image, image.shape[2], image.shape[1])
 
-        print(f"[ImageAlignResolutionGemini] Вход: batch={batch_size}, width={orig_w}, height={orig_h}")
+        print(
+            f"[ImageAlignResolutionGemini] Вход: batch={batch_size}, width={orig_w}, height={orig_h}"
+        )
         orig_ratio = orig_w / orig_h if orig_h != 0 else 1.0
 
         # Выбор ближайшего соотношения сторон из списка
@@ -142,7 +160,9 @@ class ImageGeminiResolutionAligner:
                 best_diff = diff
                 best_target = (name, tw, th)
         target_name, target_w, target_h = best_target
-        print(f"[ImageAlignResolutionGemini] Выбранное соотношение: {target_name} ({target_w}x{target_h})")
+        print(
+            f"[ImageAlignResolutionGemini] Выбранное соотношение: {target_name} ({target_w}x{target_h})"
+        )
 
         # Рассчитать финальные размеры
         if preserve_original_size:
@@ -161,11 +181,15 @@ class ImageGeminiResolutionAligner:
             # after min, re-make divisible
             new_w = self._make_divisible_by_32(new_w)
             new_h = self._make_divisible_by_32(new_h)
-            print(f"[ImageAlignResolutionGemini] preserve_original_size=True -> рассчитаны размеры {new_w}x{new_h}")
+            print(
+                f"[ImageAlignResolutionGemini] preserve_original_size=True -> рассчитаны размеры {new_w}x{new_h}"
+            )
         else:
             new_w = self._make_divisible_by_32(int(target_w))
             new_h = self._make_divisible_by_32(int(target_h))
-            print(f"[ImageAlignResolutionGemini] preserve_original_size=False -> использованы стандартные размеры {new_w}x{new_h}")
+            print(
+                f"[ImageAlignResolutionGemini] preserve_original_size=False -> использованы стандартные размеры {new_w}x{new_h}"
+            )
 
         # Ensure non-zero
         new_w = max(32, new_w)
@@ -193,7 +217,9 @@ class ImageGeminiResolutionAligner:
                     scale = max(new_w / iw, new_h / ih)
                     intermediate_w = max(1, int(round(iw * scale)))
                     intermediate_h = max(1, int(round(ih * scale)))
-                    pil_resized = pil.resize((intermediate_w, intermediate_h), resample=resample)
+                    pil_resized = pil.resize(
+                        (intermediate_w, intermediate_h), resample=resample
+                    )
 
                     # Определяем позицию обрезки в зависимости от side
                     if side == "по середине":
@@ -251,9 +277,8 @@ class ImageGeminiResolutionAligner:
 
         return (original_image, orig_w, orig_h, new_image, new_w, new_h)
 
-# --- Регистрация ноды в ComfyUI ---
-NODE_CLASS_MAPPINGS = {"ImageGeminiResolutionAligner": ImageGeminiResolutionAligner}
 
-NODE_DISPLAY_NAME_MAPPINGS = {
-    "ImageGeminiResolutionAligner": "Image Align Resolution (Gemini)"
-}
+# --- Регистрация ноды в ComfyUI ---
+NODE_CLASS_MAPPINGS = {"ImageScaleForGemini": ImageScaleForGemini}
+
+NODE_DISPLAY_NAME_MAPPINGS = {"ImageScaleForGemini": "Image Scale For Gemini"}
