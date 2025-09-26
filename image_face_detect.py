@@ -2,7 +2,7 @@
 
 import os
 import urllib.request
-from typing import List, Tuple
+from typing import List, Tuple, Optional
 
 import cv2
 import numpy as np
@@ -219,12 +219,71 @@ def _masks_to_image_batch(masks_u8: List[np.ndarray], h: int, w: int) -> torch.T
     return torch.from_numpy(stack)
 
 
+def _pad_crops_to_batch(
+    crops: List[np.ndarray], fallback_h: int, fallback_w: int
+) -> torch.Tensor:
+    """
+    Приводит список цветных кропов (HxWx3, uint8) к батчу IMAGE одинакового размера методом pad-to-max.
+    Если список пуст — возвращает один чёрный кадр размера исходника (fallback_h, fallback_w).
+    """
+    if not crops:
+        z = np.zeros((1, fallback_h, fallback_w, 3), dtype=np.float32)
+        return torch.from_numpy(z)
+
+    max_h = max(c.shape[0] for c in crops)
+    max_w = max(c.shape[1] for c in crops)
+    batch = []
+    for c in crops:
+        h, w = c.shape[:2]
+        canvas = np.zeros((max_h, max_w, 3), dtype=np.uint8)
+        off_y = (max_h - h) // 2
+        off_x = (max_w - w) // 2
+        canvas[off_y : off_y + h, off_x : off_x + w, :] = c
+        batch.append(canvas.astype(np.float32) / 255.0)
+    return torch.from_numpy(np.stack(batch, axis=0))
+
+
+def _draw_dashed_rect(
+    img: np.ndarray,
+    pt1: Tuple[int, int],
+    pt2: Tuple[int, int],
+    color: Tuple[int, int, int],
+    thickness: int,
+    dash: int = 10,
+    gap: int = 6,
+) -> None:
+    """
+    Пунктирная рамка по периметру прямоугольника.
+    """
+    x1, y1 = pt1
+    x2, y2 = pt2
+
+    def _draw_segment(p0, p1):
+        cv2.line(img, p0, p1, color, thickness, lineType=cv2.LINE_8)
+
+    # Верх/низ
+    x = x1
+    while x < x2:
+        x_end = min(x + dash, x2)
+        _draw_segment((x, y1), (x_end, y1))
+        _draw_segment((x, y2), (x_end, y2))
+        x += dash + gap
+    # Лево/право
+    y = y1
+    while y < y2:
+        y_end = min(y + dash, y2)
+        _draw_segment((x1, y), (x1, y_end))
+        _draw_segment((x2, y), (x2, y_end))
+        y += dash + gap
+
+
 class ImageFaceDetect:
     """
-    Детекция лиц в ROI тел (YOLO-face).
-    Для каждого тела -> одно лицо (наибольшая площадь), NMS глобально.
-    Маска лица всегда создаётся как заполненный овал, вписанный в bbox лица.
-    Без кэширования моделей; после использования — очистка памяти.
+    Детекция лиц (YOLO-face).
+    Режимы:
+      • BODY_BBOXES непустой → одно лицо на тело (самое крупное в ROI), глобальный NMS.
+      • BODY_BBOXES пустой/нет → детекция по всему кадру, берем все лица (после порога площади и NMS).
+    Маска лица — заполненный овал по bbox. Дополнительно: кропы лиц и общий кроп всех лиц с паддингом.
     """
 
     @classmethod
@@ -232,9 +291,9 @@ class ImageFaceDetect:
         return {
             "required": {
                 "image": ("IMAGE",),
-                "BODY_BBOXES": ("BBOX_LIST",),
             },
             "optional": {
+                "BODY_BBOXES": ("BBOX_LIST",),
                 "device": (["auto", "cpu", "cuda:0"], {"default": "auto"}),
                 "conf": (
                     "FLOAT",
@@ -266,6 +325,10 @@ class ImageFaceDetect:
                     "FLOAT",
                     {"default": 10.0, "min": 0.0, "max": 50.0, "step": 1.0},
                 ),
+                "face_crop_pad_percent": (
+                    "FLOAT",
+                    {"default": 10.0, "min": 0.0, "max": 50.0, "step": 1.0},
+                ),
             },
         }
 
@@ -275,6 +338,8 @@ class ImageFaceDetect:
         "IMAGE",  # FACE_MASKS (батч IMAGE: B×H×W×3)
         "BOOLEAN",  # FOUND_FACE
         "IMAGE",  # DEBUG_IMAGE
+        "IMAGE",  # FACE_CROPS (батч кропов лиц, pad-to-max)
+        "IMAGE",  # ALL_FACES_CROP (один общий кроп)
     )
     RETURN_NAMES = (
         "IMAGE",
@@ -282,6 +347,8 @@ class ImageFaceDetect:
         "FACE_MASKS",
         "FOUND_FACE",
         "DEBUG_IMAGE",
+        "FACE_CROPS",
+        "ALL_FACES_CROP",
     )
     FUNCTION = "execute"
     CATEGORY = "Masquerade/Detect"
@@ -437,7 +504,7 @@ class ImageFaceDetect:
             _, fbbox = best
             fx1, fy1, fw, fh = fbbox
 
-            # === Маска как заполненный овал по bbox (ВСЕГДА) ===
+            # Маска как заполненный овал по bbox
             full = np.zeros((H, W), dtype=np.uint8)
             cx = int(round(fx1 + fw / 2.0))
             cy = int(round(fy1 + fh / 2.0))
@@ -447,7 +514,6 @@ class ImageFaceDetect:
                 cv2.ellipse(full, (cx, cy), (ax, ay), 0, 0, 360, 255, -1)
                 raw_mask = full
             except Exception:
-                # На случай неожиданных ошибок — безопасный прямоугольник
                 raw_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.rectangle(
                     raw_mask, (fx1, fy1), (fx1 + fw, fy1 + fh), 255, thickness=-1
@@ -468,10 +534,115 @@ class ImageFaceDetect:
         accepted_bboxes = [accepted_bboxes[i] for i in order]
         return accepted_masks, accepted_bboxes, rejected_bboxes
 
+    def _detect_faces_global(
+        self,
+        img: np.ndarray,
+        model,
+        conf: float,
+        thr_area: float,
+        mask_blur_radius: int,
+    ) -> Tuple[
+        List[np.ndarray],
+        List[Tuple[int, int, int, int]],
+        List[Tuple[int, int, int, int]],
+    ]:
+        """
+        Детекция по всему изображению. Возвращает все лица, прошедшие порог площади и NMS.
+        """
+        H, W = img.shape[:2]
+        try:
+            results = model.predict(
+                source=[img],
+                conf=conf,
+                iou=0.45,
+                max_det=200,
+                verbose=False,
+                device=None,
+            )
+        except Exception as e:
+            raise RuntimeError(
+                f"[ImageFaceDetect] YOLO face predict failed: {e}"
+            ) from e
+
+        accepted_masks: List[np.ndarray] = []
+        accepted_bboxes: List[Tuple[int, int, int, int]] = []
+        rejected_bboxes: List[Tuple[int, int, int, int]] = []
+
+        fr = results[0] if isinstance(results, list) and len(results) > 0 else results
+        try:
+            f_xyxy = (
+                fr.boxes.xyxy.detach().cpu().numpy().astype(np.float32)
+                if getattr(fr, "boxes", None) is not None
+                else np.zeros((0, 4), dtype=np.float32)
+            )
+        except Exception:
+            f_xyxy = np.zeros((0, 4), dtype=np.float32)
+
+        for i in range(f_xyxy.shape[0]):
+            x1f, y1f, x2f, y2f = f_xyxy[i]
+            x1 = _clip_int(int(round(x1f)), 0, W - 1)
+            y1 = _clip_int(int(round(y1f)), 0, H - 1)
+            x2 = _clip_int(int(round(x2f)), 0, W)
+            y2 = _clip_int(int(round(y2f)), 0, H)
+            w = max(0, x2 - x1)
+            h = max(0, y2 - y1)
+            if w <= 0 or h <= 0:
+                continue
+            bbox = (x1, y1, w, h)
+            area = float(w * h)
+            if area < thr_area:
+                rejected_bboxes.append(bbox)
+                continue
+
+            full = np.zeros((H, W), dtype=np.uint8)
+            cx = int(round(x1 + w / 2.0))
+            cy = int(round(y1 + h / 2.0))
+            ax = max(1, int(round(w / 2.0)))
+            ay = max(1, int(round(h / 2.0)))
+            try:
+                cv2.ellipse(full, (cx, cy), (ax, ay), 0, 0, 360, 255, -1)
+                raw_mask = full
+            except Exception:
+                raw_mask = np.zeros((H, W), dtype=np.uint8)
+                cv2.rectangle(raw_mask, (x1, y1), (x1 + w, y1 + h), 255, thickness=-1)
+
+            proc_mask = _postprocess_mask(raw_mask, mask_blur_radius)
+            accepted_masks.append(proc_mask)
+            accepted_bboxes.append(bbox)
+
+        # Глобальный NMS
+        accepted_bboxes, accepted_masks = _nms_by_iou_xywh(
+            accepted_bboxes, accepted_masks, iou_thr=0.6
+        )
+
+        # Сортировка слева→направо
+        order = sorted(range(len(accepted_bboxes)), key=lambda i: accepted_bboxes[i][0])
+        accepted_masks = [accepted_masks[i] for i in order]
+        accepted_bboxes = [accepted_bboxes[i] for i in order]
+
+        return accepted_masks, accepted_bboxes, rejected_bboxes
+
+    def _compute_padded_rect(
+        self, bbox: Tuple[int, int, int, int], pad_percent: float, W: int, H: int
+    ) -> Tuple[int, int, int, int]:
+        """
+        Возвращает паддинговый прямоугольник (x,y,w,h), ограниченный границами изображения.
+        """
+        x, y, w, h = bbox
+        pad_x = int(round(max(0.0, float(pad_percent)) * w / 100.0))
+        pad_y = int(round(max(0.0, float(pad_percent)) * h / 100.0))
+        x1 = _clip_int(x - pad_x, 0, W - 1)
+        y1 = _clip_int(y - pad_y, 0, H - 1)
+        x2 = _clip_int(x + w + pad_x, 0, W)
+        y2 = _clip_int(y + h + pad_y, 0, H)
+        nx, ny = x1, y1
+        nw, nh = max(0, x2 - x1), max(0, y2 - y1)
+        return nx, ny, nw, nh
+
     def execute(
         self,
         image: torch.Tensor,
-        BODY_BBOXES,
+        BODY_BBOXES: Optional[List[Tuple[int, int, int, int]]] = None,
         device: str = "auto",
         conf: float = 0.25,
         mask_blur_radius: int = 0,
@@ -480,17 +651,20 @@ class ImageFaceDetect:
         face_model: str = "yolov12s-face.pt",
         face_min_component_percent: float = 1.0,
         face_roi_pad_percent: float = 10.0,
+        face_crop_pad_percent: float = 10.0,
     ):
         # --- вход ---
         try:
-            img = _tensor_to_np_image(image)
+            img = _tensor_to_np_image(image)  # uint8 HxWx3
         except Exception as e:
             raise RuntimeError(f"[ImageFaceDetect] Invalid IMAGE tensor: {e}") from e
 
         try:
-            body_bboxes_xywh = [
-                (int(x), int(y), int(w), int(h)) for (x, y, w, h) in BODY_BBOXES
-            ]
+            body_bboxes_xywh = []
+            if BODY_BBOXES:
+                body_bboxes_xywh = [
+                    (int(x), int(y), int(w), int(h)) for (x, y, w, h) in BODY_BBOXES
+                ]
         except Exception as e:
             raise RuntimeError(f"[ImageFaceDetect] Invalid BODY_BBOXES: {e}") from e
 
@@ -505,18 +679,30 @@ class ImageFaceDetect:
         # --- модель лиц ---
         model_face = self._load_face_model(face_model, dev, precision)
 
+        # --- детекция ---
         try:
-            face_masks_u8, face_bboxes_xywh, rejected_face_bboxes = (
-                self._detect_faces_for_bodies(
-                    img=img,
-                    body_bboxes=body_bboxes_xywh,
-                    model=model_face,
-                    conf=conf,
-                    thr_area=thr_face_area,
-                    mask_blur_radius=mask_blur_radius,
-                    pad_percent=face_roi_pad_percent,
+            if body_bboxes_xywh:
+                face_masks_u8, face_bboxes_xywh, rejected_face_bboxes = (
+                    self._detect_faces_for_bodies(
+                        img=img,
+                        body_bboxes=body_bboxes_xywh,
+                        model=model_face,
+                        conf=conf,
+                        thr_area=thr_face_area,
+                        mask_blur_radius=mask_blur_radius,
+                        pad_percent=face_roi_pad_percent,
+                    )
                 )
-            )
+            else:
+                face_masks_u8, face_bboxes_xywh, rejected_face_bboxes = (
+                    self._detect_faces_global(
+                        img=img,
+                        model=model_face,
+                        conf=conf,
+                        thr_area=thr_face_area,
+                        mask_blur_radius=mask_blur_radius,
+                    )
+                )
         finally:
             _cleanup_model(model_face, dev)
 
@@ -527,6 +713,39 @@ class ImageFaceDetect:
         face_bboxes_list = [
             [int(x), int(y), int(w), int(h)] for (x, y, w, h) in face_bboxes_xywh
         ]
+
+        # --- построение паддинговых кропов для лиц ---
+        padded_rects = []
+        face_crops_np: List[np.ndarray] = []
+        if found_face:
+            for x, y, w, h in face_bboxes_xywh:
+                px, py, pw, ph = self._compute_padded_rect(
+                    (x, y, w, h), face_crop_pad_percent, W, H
+                )
+                if pw > 0 and ph > 0:
+                    crop = img[py : py + ph, px : px + pw, :].copy()
+                    face_crops_np.append(crop)
+                padded_rects.append((px, py, pw, ph))
+        # батч кропов (pad-to-max)
+        face_crops_batch = _pad_crops_to_batch(face_crops_np, H, W)
+
+        # --- общий кроп всех лиц ---
+        if found_face and padded_rects:
+            xs1 = [r[0] for r in padded_rects]
+            ys1 = [r[1] for r in padded_rects]
+            xs2 = [r[0] + r[2] for r in padded_rects]
+            ys2 = [r[1] + r[3] for r in padded_rects]
+            ux1 = int(max(0, min(xs1)))
+            uy1 = int(max(0, min(ys1)))
+            ux2 = int(min(W, max(xs2)))
+            uy2 = int(min(H, max(ys2)))
+            if ux2 > ux1 and uy2 > uy1:
+                all_faces_crop_np = img[uy1:uy2, ux1:ux2, :].copy()
+            else:
+                all_faces_crop_np = img.copy()
+        else:
+            all_faces_crop_np = img.copy()
+        all_faces_crop_tensor = _np_image_to_tensor(all_faces_crop_np)
 
         # --- DEBUG ---
         debug = img.copy()
@@ -566,12 +785,57 @@ class ImageFaceDetect:
             cv2.line(debug, (x, y), (x2, y2), (0, 0, 255), thickness=t)
             cv2.line(debug, (x2, y), (x, y2), (0, 0, 255), thickness=t)
 
+        # паддинговые bbox для лиц — пурпурные
+        PURPLE = (255, 0, 255)
+        if padded_rects:
+            for px, py, pw, ph in padded_rects:
+                if pw > 0 and ph > 0:
+                    cv2.rectangle(
+                        debug,
+                        (px, py),
+                        (px + pw, py + ph),
+                        PURPLE,
+                        thickness=max(1, t - 2),
+                    )
+
+            # общий bbox — белая пунктирная рамка
+            xs1 = [r[0] for r in padded_rects]
+            ys1 = [r[1] for r in padded_rects]
+            xs2 = [r[0] + r[2] for r in padded_rects]
+            ys2 = [r[1] + r[3] for r in padded_rects]
+            ux1 = int(max(0, min(xs1)))
+            uy1 = int(max(0, min(ys1)))
+            ux2 = int(min(W, max(xs2)))
+            uy2 = int(min(H, max(ys2)))
+            if ux2 > ux1 and uy2 > uy1:
+                _draw_dashed_rect(
+                    debug,
+                    (ux1, uy1),
+                    (ux2, uy2),
+                    (255, 255, 255),
+                    max(1, t - 3),
+                    dash=10,
+                    gap=6,
+                )
+                cv2.putText(
+                    debug,
+                    "ALL_FACES",
+                    (ux1 + 5, max(uy1 + 15, 15)),
+                    cv2.FONT_HERSHEY_SIMPLEX,
+                    0.5,
+                    (255, 255, 255),
+                    1,
+                    cv2.LINE_AA,
+                )
+
         return (
             _np_image_to_tensor(img),  # IMAGE
             face_bboxes_list,  # FACE_BBOXES
             face_masks_batch,  # FACE_MASKS (IMAGE батч)
             bool(found_face),  # FOUND_FACE
             _np_image_to_tensor(debug),  # DEBUG_IMAGE
+            face_crops_batch,  # FACE_CROPS (батч)
+            all_faces_crop_tensor,  # ALL_FACES_CROP (один кадр)
         )
 
 
