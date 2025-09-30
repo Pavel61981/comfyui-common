@@ -33,7 +33,7 @@ def _resolve_device(name: str) -> str:
     return name
 
 
-def _set_model_precision(yolo_model, precision: str) -> None:
+def _set_model_precision(yolo_model) -> None:
     try:
         m = getattr(yolo_model, "model", None)
         if m is None:
@@ -189,21 +189,13 @@ class ImageBodyDetect:
             "required": {"image": ("IMAGE",)},
             "optional": {
                 "device": (["auto", "cpu", "cuda:0"], {"default": "auto"}),
+                "body_model": (
+                    ["yolov8n-seg.pt", "yolov8s-seg.pt", "yolov8m-seg.pt"],
+                    {"default": "yolov8m-seg.pt"},
+                ),
                 "conf": (
                     "FLOAT",
                     {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01},
-                ),
-                "mask_blur_radius": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 50, "step": 1},
-                ),
-                "debug_bbox_thickness": (
-                    "INT",
-                    {"default": 6, "min": 1, "max": 10, "step": 1},
-                ),
-                "body_model": (
-                    ["yolov8n-seg.pt", "yolov8s-seg.pt", "yolov8m-seg.pt"],
-                    {"default": "yolov8s-seg.pt"},
                 ),
                 "body_min_component_percent": (
                     "FLOAT",
@@ -212,6 +204,14 @@ class ImageBodyDetect:
                 "mask_padding_px": (
                     "INT",
                     {"default": 0, "min": -256, "max": 256, "step": 1},
+                ),
+                "mask_blur_radius": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 50, "step": 1},
+                ),
+                "debug_bbox_thickness": (
+                    "INT",
+                    {"default": 5, "min": 1, "max": 10, "step": 1},
                 ),
             },
         }

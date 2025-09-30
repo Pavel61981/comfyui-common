@@ -304,22 +304,6 @@ class ImageFaceDetect:
             "optional": {
                 "BODY_BBOXES": ("BBOX_LIST",),
                 "device": (["auto", "cpu", "cuda:0"], {"default": "auto"}),
-                "conf": (
-                    "FLOAT",
-                    {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01},
-                ),
-                "mask_blur_radius": (
-                    "INT",
-                    {"default": 0, "min": 0, "max": 50, "step": 1},
-                ),
-                "mask_padding_px": (
-                    "INT",
-                    {"default": 0, "min": -256, "max": 256, "step": 1},
-                ),
-                "debug_bbox_thickness": (
-                    "INT",
-                    {"default": 6, "min": 1, "max": 10, "step": 1},
-                ),
                 "face_model": (
                     [
                         "yolov12n-face.pt",
@@ -327,11 +311,15 @@ class ImageFaceDetect:
                         "yolov12m-face.pt",
                         "yolov12l-face.pt",
                     ],
-                    {"default": "yolov12s-face.pt"},
+                    {"default": "yolov12l-face.pt"},
+                ),
+                "conf": (
+                    "FLOAT",
+                    {"default": 0.25, "min": 0.0, "max": 1.0, "step": 0.01},
                 ),
                 "face_min_component_percent": (
                     "FLOAT",
-                    {"default": 1.0, "min": 0.0, "max": 5.0, "step": 0.01},
+                    {"default": 10.0, "min": 0.0, "max": 50.0, "step": 0.01},
                 ),
                 "face_roi_pad_percent": (
                     "FLOAT",
@@ -340,6 +328,18 @@ class ImageFaceDetect:
                 "face_crop_pad_percent": (
                     "FLOAT",
                     {"default": 10.0, "min": 0.0, "max": 50.0, "step": 1.0},
+                ),
+                "mask_padding_px": (
+                    "INT",
+                    {"default": 0, "min": -256, "max": 256, "step": 1},
+                ),
+                "mask_blur_radius": (
+                    "INT",
+                    {"default": 0, "min": 0, "max": 50, "step": 1},
+                ),
+                "debug_bbox_thickness": (
+                    "INT",
+                    {"default": 5, "min": 1, "max": 10, "step": 1},
                 ),
             },
         }
