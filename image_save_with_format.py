@@ -76,13 +76,13 @@ class SaveImageWithFormat:
         clean_subdir = subdirectory_name.strip().strip("/\\")
         clean_filename_base = file_name.strip().strip("/\\")
 
-        base_name, extension = os.path.splitext(clean_filename_base)
-        if extension:
-            raise ValueError(
-                f"Имя файла '{file_name}' не должно содержать расширение. Введите только имя."
-            )
+        # base_name, extension = os.path.splitext(clean_filename_base)
+        # if extension:
+        #     raise ValueError(
+        #         f"Имя файла '{file_name}' не должно содержать расширение. Введите только имя."
+        #     )
 
-        final_filename = f"{base_name}.{file_extension}"
+        final_filename = f"{clean_filename_base}.{file_extension}"
         full_path = os.path.join(clean_dir, clean_subdir, final_filename)
         output_dir = os.path.dirname(full_path)
         os.makedirs(output_dir, exist_ok=True)
@@ -108,7 +108,9 @@ class SaveImageWithFormat:
         # Выбор параметров сохранения в зависимости от формата
         save_options = {}
         if file_extension == "png":
-            save_options = {"compress_level": 6}  # Быстро + без потерь + разумный размер
+            save_options = {
+                "compress_level": 6
+            }  # Быстро + без потерь + разумный размер
         elif file_extension == "webp":
             save_options = {"lossless": True, "quality": 100}
         elif file_extension == "jpeg":

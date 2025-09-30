@@ -6,7 +6,8 @@ class ImageIntTilePlanner:
     """
     Нода 'Image Tile Planner' — рассчитывает:
       - размер тайла (Tile_Size), кратный 64,
-      - шаг (Tile_Stride) = 3/4 от Tile_Size, округлён вниз до кратности 64, минимум 64,
+      - шаг (Tile_Stride) = выбранная пропорция от Tile_Size ("3 / 4" или "1 / 2"),
+        округлён вниз до кратности 64, минимум 64,
       - флаг Use_Tiles = (max(H, W) > Start_Tiling_At),
       - количество тайлов по ширине/высоте (Tiles_X/Tiles_Y) в режиме 'cover':
         последний тайл сдвигается к границе при необходимости, чтобы покрыть всё изображение.
@@ -21,11 +22,19 @@ class ImageIntTilePlanner:
                 "Image": ("IMAGE",),
                 "Max_Tile_Size": ("INT", {"default": 1024, "min": 64, "step": 64}),
                 "Start_Tiling_At": ("INT", {"default": 2048, "min": 64, "step": 64}),
+                "Stride_Ratio": (["3 / 4", "1 / 2"],),
             }
         }
 
     RETURN_TYPES = ("IMAGE", "INT", "INT", "BOOLEAN", "INT", "INT")
-    RETURN_NAMES = ("Image", "Tile_Size", "Tile_Stride", "Use_Tiles", "Tiles_X", "Tiles_Y")
+    RETURN_NAMES = (
+        "Image",
+        "Tile_Size",
+        "Tile_Stride",
+        "Use_Tiles",
+        "Tiles_X",
+        "Tiles_Y",
+    )
     FUNCTION = "execute"
     CATEGORY = "utils/tiling"
     OUTPUT_NODE = False
@@ -42,9 +51,34 @@ class ImageIntTilePlanner:
             print("[Image Tile Planner] Warning: Max_Tile_Size < 64; corrected to 64.")
             max_tile_size = 64
         if start_tiling_at < 64:
-            print("[Image Tile Planner] Warning: Start_Tiling_At < 64; corrected to 64.")
+            print(
+                "[Image Tile Planner] Warning: Start_Tiling_At < 64; corrected to 64."
+            )
             start_tiling_at = 64
         return max_tile_size, start_tiling_at
+
+    @staticmethod
+    def _parse_stride_ratio(ratio_choice: str):
+        """
+        Преобразует строку вида '3 / 4' или '1 / 2' в числитель и знаменатель.
+        Возвращает (3,4) или (1,2). По умолчанию — (3,4) с предупреждением.
+        """
+        if not isinstance(ratio_choice, str):
+            print(
+                "[Image Tile Planner] Warning: Stride_Ratio is not a string; defaulting to '3 / 4'."
+            )
+            return 3, 4
+        normalized = ratio_choice.replace(" ", "")
+        mapping = {
+            "3/4": (3, 4),
+            "1/2": (1, 2),
+        }
+        if normalized in mapping:
+            return mapping[normalized]
+        print(
+            f"[Image Tile Planner] Warning: Unsupported Stride_Ratio '{ratio_choice}'; defaulting to '3 / 4'."
+        )
+        return 3, 4
 
     @staticmethod
     def _tiles_cover_count(dim: int, tile: int, stride: int) -> int:
@@ -58,7 +92,9 @@ class ImageIntTilePlanner:
             return 1
         return max(1, math.ceil(remainder / stride) + 1)
 
-    def execute(self, Image, Max_Tile_Size: int, Start_Tiling_At: int):
+    def execute(
+        self, Image, Max_Tile_Size: int, Start_Tiling_At: int, Stride_Ratio: str
+    ):
         """
         Возвращает:
         (Image, Tile_Size, Tile_Stride, Use_Tiles, Tiles_X, Tiles_Y)
@@ -73,15 +109,21 @@ class ImageIntTilePlanner:
             if Image is None:
                 raise RuntimeError("[Image Tile Planner] Image is None.")
             if not hasattr(Image, "shape"):
-                raise RuntimeError("[Image Tile Planner] Unsupported image type: no .shape attribute.")
+                raise RuntimeError(
+                    "[Image Tile Planner] Unsupported image type: no .shape attribute."
+                )
 
             shape = Image.shape  # ожидается [B, H, W, C]
             if len(shape) != 4:
-                raise RuntimeError(f"[Image Tile Planner] Expected image shape [B,H,W,C], got {shape}.")
+                raise RuntimeError(
+                    f"[Image Tile Planner] Expected image shape [B,H,W,C], got {shape}."
+                )
 
             _, H, W, C = shape
             if C not in (3, 4):
-                print(f"[Image Tile Planner] Warning: channel count is {C}, expected 3 or 4.")
+                print(
+                    f"[Image Tile Planner] Warning: channel count is {C}, expected 3 or 4."
+                )
 
             if H < 64 or W < 64:
                 raise RuntimeError(
@@ -101,8 +143,11 @@ class ImageIntTilePlanner:
                     f"Check inputs: min_dim={min_dim}, Max_Tile_Size={Max_Tile_Size}."
                 )
 
+            # Пропорция шага
+            num, den = self._parse_stride_ratio(Stride_Ratio)
+
             # Шаг тайла (stride)
-            stride_base = int(tile_size * 3 / 4)
+            stride_base = int(tile_size * num / den)
             stride = self._round_down_multiple(stride_base, 64)
             if stride < 64:
                 stride = 64
@@ -115,7 +160,14 @@ class ImageIntTilePlanner:
             tiles_y = self._tiles_cover_count(int(H), int(tile_size), int(stride))
 
             # Возврат исходного изображения и метрик
-            return (Image, int(tile_size), int(stride), bool(use_tiles), int(tiles_x), int(tiles_y))
+            return (
+                Image,
+                int(tile_size),
+                int(stride),
+                bool(use_tiles),
+                int(tiles_x),
+                int(tiles_y),
+            )
 
         except RuntimeError:
             raise

@@ -33,39 +33,13 @@ def _resolve_device(name: str) -> str:
     return name
 
 
-def _prefer_precision(fp16_infer: bool, device: str) -> str:
-    """
-    'fp32' | 'bf16' | 'fp16'
-    """
-    if not fp16_infer:
-        return "fp32"
-    if device.startswith("cuda"):
-        try:
-            if (
-                hasattr(torch.cuda, "is_bf16_supported")
-                and torch.cuda.is_bf16_supported()
-            ):
-                return "bf16"
-        except Exception:
-            pass
-        return "fp16"
-    return "fp32"
-
-
 def _set_model_precision(yolo_model, precision: str) -> None:
-    """
-    Перевод модели Ultralytics в нужный dtype (тихо игнорирует ошибки).
-    """
     try:
         m = getattr(yolo_model, "model", None)
         if m is None:
             return
-        if precision == "bf16":
-            m.to(dtype=torch.bfloat16)
-        elif precision == "fp16":
-            m.to(dtype=torch.float16)
-        else:
-            m.to(dtype=torch.float32)
+
+        m.to(dtype=torch.float32)
     except Exception:
         pass
 
@@ -119,19 +93,45 @@ def _np_mask_to_tensor(mask_u8: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(m)
 
 
-def _postprocess_mask(mask_u8: np.ndarray, blur_r: int) -> np.ndarray:
+def _postprocess_mask(mask_u8: np.ndarray, pad_px: int, blur_r: int) -> np.ndarray:
     """
-    Небольшая морфология (фикс 3x3) + опциональный GaussianBlur.
-    Без кэша ядра.
+    Базовая морфология + паддинг маски + опциональный GaussianBlur.
+
+    Порядок: close(3x3 эллипс) -> dilate(3x3 эллипс) -> padding (±px, эллипс ядро) -> blur.
     """
     if mask_u8 is None or mask_u8.size == 0:
         return mask_u8
-    kernel = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-    m = cv2.morphologyEx(mask_u8, cv2.MORPH_CLOSE, kernel)
-    m = cv2.morphologyEx(m, cv2.MORPH_DILATE, kernel)
-    if blur_r > 0:
-        m = cv2.GaussianBlur(m, (blur_r * 2 + 1, blur_r * 2 + 1), 0)
-    return m
+
+    try:
+        m = mask_u8
+        if m.dtype != np.uint8:
+            m = m.astype(np.uint8, copy=False)
+
+        # Базовая морфология (как было)
+        kern_base = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kern_base)
+        m = cv2.morphologyEx(m, cv2.MORPH_DILATE, kern_base)
+
+        # Паддинг маски (расширение/сужение) — эллиптическим ядром (2*abs(pad)+1)
+        if isinstance(pad_px, (int, np.integer)) and pad_px != 0:
+            k = int(abs(pad_px))
+            # ограничение ядра: не меньше 1 и нечетное
+            ksize = max(1, 2 * k + 1)
+            kern_pad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+            if pad_px > 0:
+                m = cv2.dilate(m, kern_pad, iterations=1)
+            else:
+                m = cv2.erode(m, kern_pad, iterations=1)
+
+        # Размытие краев
+        if isinstance(blur_r, (int, np.integer)) and blur_r > 0:
+            ksize = 2 * int(blur_r) + 1
+            m = cv2.GaussianBlur(m, (ksize, ksize), 0)
+
+        return m
+    except Exception:
+        # в случае любой ошибки — вернуть исходную маску
+        return mask_u8
 
 
 def _area_polys_fast(polys: List[np.ndarray]) -> float:
@@ -201,7 +201,6 @@ class ImageBodyDetect:
                     "INT",
                     {"default": 6, "min": 1, "max": 10, "step": 1},
                 ),
-                "fp16_infer": ("BOOLEAN", {"default": False}),
                 "body_model": (
                     ["yolov8n-seg.pt", "yolov8s-seg.pt", "yolov8m-seg.pt"],
                     {"default": "yolov8s-seg.pt"},
@@ -209,6 +208,10 @@ class ImageBodyDetect:
                 "body_min_component_percent": (
                     "FLOAT",
                     {"default": 10.0, "min": 0.0, "max": 50.0, "step": 0.1},
+                ),
+                "mask_padding_px": (
+                    "INT",
+                    {"default": 0, "min": -256, "max": 256, "step": 1},
                 ),
             },
         }
@@ -240,7 +243,10 @@ class ImageBodyDetect:
             ) from e
         return YOLO
 
-    def _load_body_model(self, model_name: str, device: str, precision: str):
+    def _load_body_model(self, model_name: str, device: str):
+        """
+        Ищет веса в <ComfyUI>/models/yolo-body и рядом с файлом, иначе даёт Ultralytics скачать.
+        """
         YOLO = self._get_ultra()
         candidates = []
         body_dir = yolo_body_models_dir()
@@ -257,7 +263,7 @@ class ImageBodyDetect:
             try:
                 model = YOLO(cand)
                 model.to(device)
-                _set_model_precision(model, precision)
+                _set_model_precision(model)
                 return model
             except Exception as e:
                 last_err = e
@@ -277,6 +283,7 @@ class ImageBodyDetect:
         model,
         conf: float,
         thr_area: float,
+        mask_padding_px: int,
         mask_blur_radius: int,
     ) -> Tuple[
         List[np.ndarray],
@@ -400,13 +407,15 @@ class ImageBodyDetect:
             if raw_mask is None:
                 raw_mask = _mask_from_bbox(H, W, bbox)
 
-            proc_mask = _postprocess_mask(raw_mask, mask_blur_radius)
+            proc_mask = _postprocess_mask(
+                raw_mask, pad_px=mask_padding_px, blur_r=mask_blur_radius
+            )
             accepted_masks.append(proc_mask)
             accepted_bboxes.append(bbox)
 
-        order = sorted(range(len(accepted_bboxes)), key=lambda i: accepted_bboxes[i][0])
-        accepted_masks = [accepted_masks[i] for i in order]
-        accepted_bboxes = [accepted_bboxes[i] for i in order]
+        order = sorted(range(len(accepted_bboxes)), key=lambda j: accepted_bboxes[j][0])
+        accepted_masks = [accepted_masks[j] for j in order]
+        accepted_bboxes = [accepted_bboxes[j] for j in order]
         return accepted_masks, accepted_bboxes, rejected_bboxes
 
     def execute(
@@ -416,9 +425,9 @@ class ImageBodyDetect:
         conf: float = 0.25,
         mask_blur_radius: int = 0,
         debug_bbox_thickness: int = 6,
-        fp16_infer: bool = False,
         body_model: str = "yolov8s-seg.pt",
         body_min_component_percent: float = 10.0,
+        mask_padding_px: int = 0,
     ):
         # --- вход ---
         try:
@@ -430,12 +439,11 @@ class ImageBodyDetect:
         frame_area = float(W * H)
         thr_body_area = max(0.0, float(body_min_component_percent)) / 100.0 * frame_area
 
-        # --- девайс / точность ---
+        # --- девайс ---
         dev = _resolve_device(device)
-        precision = _prefer_precision(fp16_infer, dev)
 
-        # --- модели ---
-        model_body = self._load_body_model(body_model, dev, precision)
+        # --- модель ---
+        model_body = self._load_body_model(body_model, dev)
 
         try:
             # --- тела ---
@@ -444,6 +452,7 @@ class ImageBodyDetect:
                 model=model_body,
                 conf=conf,
                 thr_area=thr_body_area,
+                mask_padding_px=mask_padding_px,
                 mask_blur_radius=mask_blur_radius,
             )
         finally:
