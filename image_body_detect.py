@@ -10,19 +10,16 @@ import logging
 
 # ------------------------------------------------------------
 # ОТКЛЮЧЕНИЕ СЕТЕВЫХ ПРОВЕРОК ULTRALYTICS
-# Это предотвращает долгие задержки при инициализации модели
 # ------------------------------------------------------------
 try:
     from ultralytics.utils import SETTINGS
 
     SETTINGS.update({"HUB": False, "VERBOSE": False})
-    # Это сообщение будет видно в консоли при запуске ComfyUI
     print(
         "[ImageBodyDetect] Ultralytics HUB/update checks disabled for faster startup."
     )
 except Exception as e:
     print(f"[ImageBodyDetect] Warning: Failed to disable Ultralytics HUB checks: {e}")
-
 
 # ------------------------------------------------------------
 # ЛОГИРОВАНИЕ
@@ -36,7 +33,6 @@ if not logger.handlers:
     logger.addHandler(handler)
 logger.setLevel(logging.INFO)
 
-
 # ------------------------------------------------------------
 # МОДЕЛИ
 # ------------------------------------------------------------
@@ -46,6 +42,11 @@ ALLOWED_BODY_MODELS = {
     "yolov8m-seg.pt",
     "yolov8l-seg.pt",
     "yolov8x-seg.pt",
+    "yolov12n-seg.pt",
+    "yolov12s-seg.pt",
+    "yolov12m-seg.pt",
+    "yolov12l-seg.pt",
+    "yolov12x-seg.pt",
 }
 
 
@@ -145,12 +146,14 @@ def _mask_from_bbox(h: int, w: int, bbox: Tuple[int, int, int, int]) -> np.ndarr
     return m
 
 
-def _masks_to_image_batch(masks_u8: List[np.ndarray], h: int, w: int) -> torch.Tensor:
+def _masks_to_mask_batch(masks_u8: List[np.ndarray], h: int, w: int) -> torch.Tensor:
+    """
+    Формирует батч масок формата ComfyUI MASK: [B, H, W], float32 в [0..1].
+    Если детекций нет — возвращает нулевую маску [1, H, W].
+    """
     if not masks_u8:
-        return torch.from_numpy(np.zeros((1, h, w, 3), dtype=np.float32))
+        return torch.from_numpy(np.zeros((1, h, w), dtype=np.float32))
     stack = np.stack([(m.astype(np.float32) / 255.0) for m in masks_u8], axis=0)
-    stack = stack[..., np.newaxis]
-    stack = np.repeat(stack, 3, axis=3)
     return torch.from_numpy(stack)
 
 
@@ -188,7 +191,8 @@ class ImageBodyDetect:
             },
         }
 
-    RETURN_TYPES = ("IMAGE", "BBOX_LIST", "IMAGE", "BOOLEAN", "IMAGE")
+    # ВАЖНО: третий выход теперь MASK
+    RETURN_TYPES = ("IMAGE", "BBOX_LIST", "MASK", "BOOLEAN", "IMAGE")
     RETURN_NAMES = ("IMAGE", "BODY_BBOXES", "BODY_MASKS", "FOUND_BODY", "DEBUG_IMAGE")
     FUNCTION = "execute"
     CATEGORY = "Masquerade/Detect"
@@ -330,18 +334,30 @@ class ImageBodyDetect:
             _cleanup_model(model_body, dev)
 
         found_body = len(body_bboxes_xywh) > 0
-        body_masks_batch = _masks_to_image_batch(body_masks_u8, H, W)
+
+        # Готовим батч масок формата MASK: [B,H,W], float32 [0..1]
+        body_masks_batch = _masks_to_mask_batch(body_masks_u8, H, W)
+
         body_bboxes_list = [[int(v) for v in box] for box in body_bboxes_xywh]
 
-        # DEBUG-изображение
+        # DEBUG-изображение (накладываем объединённую маску в синий)
         debug = img.copy()
         if body_masks_u8:
-            combined_mask = np.any(
-                np.stack([m > 0 for m in body_masks_u8], axis=0), axis=0
-            )
-            overlay = np.zeros_like(debug)
-            overlay[combined_mask] = [0, 0, 255]  # Синий
-            debug = cv2.addWeighted(overlay, 0.35, debug, 0.65, 0)
+            # 1) без порога — оставляем полутона от блюра
+            masks_f = [
+                m.astype(np.float32) / 255.0 for m in body_masks_u8
+            ]  # [H,W] float
+            a = np.maximum.reduce(masks_f)  # [H,W] в [0..1], объединённая мягкая маска
+
+            # 2) цвет оверлея (BGR!). В вашем комментарии "Синий", но [0,0,255] — это КРАСНЫЙ в BGR.
+            color = np.array([0, 0, 255], dtype=np.float32)
+
+            # 3) перепиксельное смешивание (strength задаёт «насыщенность» подмешивания)
+            strength = 0.5  # 0..1
+            a = a * strength
+            debug = (
+                debug.astype(np.float32) * (1.0 - a)[..., None] + color * a[..., None]
+            ).astype(np.uint8)
 
         t = int(max(1, debug_bbox_thickness))
         # Принятые тела - желтые
@@ -366,7 +382,7 @@ class ImageBodyDetect:
         return (
             _np_image_to_tensor(img),
             body_bboxes_list,
-            body_masks_batch,
+            body_masks_batch,  # <-- теперь MASK [B,H,W]
             bool(found_body),
             _np_image_to_tensor(debug),
         )

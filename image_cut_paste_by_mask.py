@@ -6,6 +6,7 @@ import numpy as np
 
 # ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ОБНОВЛЕННЫЕ И НОВЫЕ) =====
 
+
 def _ensure_single_image(image: torch.Tensor) -> torch.Tensor:
     """
     Приводит батч IMAGE (BxHxWxC) к одному тензору HxWxC (float32, [0,1]).
@@ -14,11 +15,16 @@ def _ensure_single_image(image: torch.Tensor) -> torch.Tensor:
     if not torch.is_tensor(image):
         raise RuntimeError(f"[image] Ожидался torch.Tensor, получено: {type(image)}")
     if image.dim() != 4:
-        raise RuntimeError(f"[image] Ожидался батч-тензор BxHxWxC, получено: {tuple(image.shape)}")
+        raise RuntimeError(
+            f"[image] Ожидался батч-тензор BxHxWxC, получено: {tuple(image.shape)}"
+        )
     if image.shape[0] != 1:
-        raise RuntimeError(f"[image] Ожидался один кадр (batch=1), получено: {image.shape[0]}")
+        raise RuntimeError(
+            f"[image] Ожидался один кадр (batch=1), получено: {image.shape[0]}"
+        )
     # Убираем батч-измерение, чтобы работать с HxWxC
     return image.squeeze(0).to(dtype=torch.float32)
+
 
 def _ensure_mask(mask: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor:
     """
@@ -29,11 +35,15 @@ def _ensure_mask(mask: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor
 
     if mask.dim() == 3:
         if mask.shape[0] != 1:
-            raise RuntimeError(f"[mask] Ожидалась одна маска (batch=1), получено: {mask.shape[0]}")
+            raise RuntimeError(
+                f"[mask] Ожидалась одна маска (batch=1), получено: {mask.shape[0]}"
+            )
         mask = mask.squeeze(0)
 
     if mask.dim() != 2:
-        raise RuntimeError(f"[mask] Ожидался тензор HxW, после обработки батча получено: {tuple(mask.shape)}")
+        raise RuntimeError(
+            f"[mask] Ожидался тензор HxW, после обработки батча получено: {tuple(mask.shape)}"
+        )
 
     h, w = target_hw
     if mask.shape[0] != h or mask.shape[1] != w:
@@ -42,13 +52,16 @@ def _ensure_mask(mask: torch.Tensor, target_hw: Tuple[int, int]) -> torch.Tensor
         )
     return mask.clamp(0.0, 1.0).to(dtype=torch.float32)
 
+
 def _to_comfy_image(img: torch.Tensor) -> torch.Tensor:
     """HxWxC -> BxHxWxC для порта IMAGE."""
     return img.unsqueeze(0)
 
+
 def _to_comfy_mask(mask: torch.Tensor) -> torch.Tensor:
     """HxW -> BxHxW для порта MASK."""
     return mask.unsqueeze(0)
+
 
 def _compute_bbox(mask_bin: torch.Tensor) -> Tuple[int, int, int, int]:
     """
@@ -65,6 +78,7 @@ def _compute_bbox(mask_bin: torch.Tensor) -> Tuple[int, int, int, int]:
     y1 = int(ys.max().item())
     return x0, y0, (x1 - x0 + 1), (y1 - y0 + 1)
 
+
 def _expand_and_clamp_bbox(bbox, offset, w, h):
     x, y, bw, bh = bbox
     d = max(0, int(offset))
@@ -77,20 +91,27 @@ def _expand_and_clamp_bbox(bbox, offset, w, h):
     h_new = int(max(1, y1 - y0))
     return x0, y0, w_new, h_new
 
+
 def _crop(img: torch.Tensor, bbox: Tuple[int, int, int, int]):
     x, y, w, h = bbox
     return img[y : y + h, x : x + w]
 
-def _resize_hwc(img: torch.Tensor, h: int, w: int, mode: str = "bilinear") -> torch.Tensor:
+
+def _resize_hwc(
+    img: torch.Tensor, h: int, w: int, mode: str = "bilinear"
+) -> torch.Tensor:
     """
     Масштабирует HxWxC к (h,w). Возвращает HxWxC.
     """
     if img.shape[0] == h and img.shape[1] == w:
         return img
     x = img.permute(2, 0, 1).unsqueeze(0)
-    x = F.interpolate(x, size=(h, w), mode=mode, align_corners=False if mode == "bilinear" else None)
+    x = F.interpolate(
+        x, size=(h, w), mode=mode, align_corners=False if mode == "bilinear" else None
+    )
     x = x.squeeze(0).permute(1, 2, 0).contiguous()
     return x
+
 
 def _resize_mask_hw(mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
     """
@@ -103,6 +124,7 @@ def _resize_mask_hw(mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
     x = x.squeeze(0).squeeze(0)
     return x.clamp(0.0, 1.0)
 
+
 def _distance_transform_edt_outside(mask_bin: torch.Tensor) -> torch.Tensor:
     """
     Distance transform НАРУЖУ от маски. На выходе расстояние (px)
@@ -112,8 +134,11 @@ def _distance_transform_edt_outside(mask_bin: torch.Tensor) -> torch.Tensor:
     # Инвертируем маску, чтобы distance_transform искал расстояние до белых пикселей (которые были чёрными)
     mask_numpy = (1.0 - mask_bin.cpu().numpy()).astype(np.uint8)
     dist_numpy = distance_transform_edt(mask_numpy, sampling=1)
-    dist_tensor = torch.from_numpy(dist_numpy).to(device=mask_bin.device, dtype=torch.float32)
+    dist_tensor = torch.from_numpy(dist_numpy).to(
+        device=mask_bin.device, dtype=torch.float32
+    )
     return dist_tensor
+
 
 def _empty_debug_overlay(device: torch.device) -> torch.Tensor:
     """
@@ -122,7 +147,9 @@ def _empty_debug_overlay(device: torch.device) -> torch.Tensor:
     """
     return torch.zeros((1, 1, 3), dtype=torch.float32, device=device)
 
+
 # ===== НОДЫ (ОБНОВЛЕННАЯ ImageCutByMask) =====
+
 
 class ImageCutByMask:
     """
@@ -140,12 +167,23 @@ class ImageCutByMask:
                 "offset": ("INT", {"default": 16, "min": 0, "max": 4096, "step": 1}),
                 "feather_px": ("INT", {"default": 8, "min": 0, "max": 4096, "step": 1}),
                 "debug_enabled": ("BOOLEAN", {"default": False}),
-                "debug_alpha": ("FLOAT", {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01}),
+                "debug_alpha": (
+                    "FLOAT",
+                    {"default": 0.5, "min": 0.0, "max": 1.0, "step": 0.01},
+                ),
             }
         }
 
     RETURN_TYPES = ("IMAGE", "IMAGE", "MASK", "BBOX", "INT", "INT", "IMAGE")
-    RETURN_NAMES = ("base_image", "cropped_image", "cropped_mask", "bbox", "crop_width", "crop_height", "debug_overlay")
+    RETURN_NAMES = (
+        "base_image",
+        "cropped_image",
+        "cropped_mask",
+        "bbox",
+        "crop_width",
+        "crop_height",
+        "debug_overlay",
+    )
     FUNCTION = "execute"
     CATEGORY = "image/mask"
     OUTPUT_NODE = True  # Превью отображает debug_overlay (или «ничего», если отключено)
@@ -154,9 +192,9 @@ class ImageCutByMask:
         try:
             img = _ensure_single_image(image)
             H, W, _ = img.shape
-            m = _ensure_mask(mask, (H, W))
-
-            m_bin = (m > 0.0).to(torch.float32)
+            m_soft = _ensure_mask(mask, (H, W))  # [H,W] float32, 0..1 с полутоном
+            thr = 1 / 255  # или 1/255 если хотите «любой неноль»
+            m_bin = (m_soft >= thr).to(torch.float32)  # для bbox и distance transform
 
             x, y, w, h = _compute_bbox(m_bin)
 
@@ -166,22 +204,24 @@ class ImageCutByMask:
             effective_feather = max(0, min(int(feather_px), int(offset)))
 
             if effective_feather <= 0:
-                feather_full = m_bin
+                feather_full = m_soft  # сохраняем входной блюр как есть
             else:
-                # Вычисляем карту расстояний от внешних пикселей до ближайшего края маски
-                dist_out = _distance_transform_edt_outside(m_bin)
+                dist_out = _distance_transform_edt_outside(
+                    m_bin
+                )  # DT считаем по бинарной
+                outward_feather = (
+                    1.0 - (dist_out - 1.0) / float(effective_feather)
+                ).clamp(0.0, 1.0)
+                outward_feather = outward_feather * (
+                    1.0 - m_bin
+                )  # только снаружи «твёрдой» маски
+                feather_full = torch.maximum(
+                    m_soft, outward_feather
+                )  # <— сохраняем ваш входной градиент
 
-                # Создаем градиент размытия, который спадает от 1 до 0 на расстоянии effective_feather
-                outward_feather = (1.0 - (dist_out - 1.0) / float(effective_feather)).clamp(0.0, 1.0)
-
-                # Применяем размытие только к области вне исходной бинарной маски
-                outward_feather = outward_feather * (1.0 - m_bin)
-
-                # Объединяем исходную маску и внешнее размытие
-                feather_full = (m_bin + outward_feather).clamp(0.0, 1.0)
-
-
-            x_exp, y_exp, w_exp, h_exp = _expand_and_clamp_bbox((x, y, w, h), int(offset), W, H)
+            x_exp, y_exp, w_exp, h_exp = _expand_and_clamp_bbox(
+                (x, y, w, h), int(offset), W, H
+            )
 
             patch = _crop(img, (x_exp, y_exp, w_exp, h_exp))
             mask_cropped = _crop(feather_full, (x_exp, y_exp, w_exp, h_exp))
@@ -194,7 +234,9 @@ class ImageCutByMask:
                 # ограничиваем альфу
                 da = float(max(0.0, min(1.0, debug_alpha)))
                 # цвет маски (1,0,0) и альфа по маске
-                red = torch.tensor([1.0, 0.0, 0.0], device=patch.device, dtype=patch.dtype).view(1, 1, 3)
+                red = torch.tensor(
+                    [1.0, 0.0, 0.0], device=patch.device, dtype=patch.dtype
+                ).view(1, 1, 3)
                 alpha = (da * mask_cropped).unsqueeze(-1)  # HxWx1
                 overlay = (1.0 - alpha) * patch + alpha * red
                 overlay = overlay.clamp(0.0, 1.0)
@@ -204,13 +246,13 @@ class ImageCutByMask:
                 debug_img = _empty_debug_overlay(device=img.device)
 
             return (
-                image,                          # base_image (B x H x W x C)
-                _to_comfy_image(patch),         # cropped_image
-                _to_comfy_mask(mask_cropped),   # cropped_mask
-                bbox,                           # bbox
-                crop_w,                         # crop_width
-                crop_h,                         # crop_height
-                _to_comfy_image(debug_img),     # debug_overlay (для превью)
+                image,  # base_image (B x H x W x C)
+                _to_comfy_image(patch),  # cropped_image
+                _to_comfy_mask(mask_cropped),  # cropped_mask
+                bbox,  # bbox
+                crop_w,  # crop_width
+                crop_h,  # crop_height
+                _to_comfy_image(debug_img),  # debug_overlay (для превью)
             )
 
         except Exception as e:
@@ -241,7 +283,9 @@ class ImagePasteByCoords:
             patch = _ensure_single_image(cropped_image)
 
             if not isinstance(bbox, (tuple, list)) or len(bbox) != 4:
-                raise RuntimeError(f"[bbox] Ожидался кортеж (x, y, w, h), получено: {bbox}")
+                raise RuntimeError(
+                    f"[bbox] Ожидался кортеж (x, y, w, h), получено: {bbox}"
+                )
             x, y, w, h = [int(v) for v in bbox]
             if w <= 0 or h <= 0:
                 raise RuntimeError(f"[bbox] Некорректный размер bbox: {(w,h)}")
@@ -258,16 +302,22 @@ class ImagePasteByCoords:
             # 1. Сначала приводим маску к тензору HxW без проверки размера.
             #    Эта логика заменяет вызов _ensure_mask с проверкой.
             if not torch.is_tensor(cropped_mask):
-                raise RuntimeError(f"[cropped_mask] Ожидался torch.Tensor, получено: {type(cropped_mask)}")
+                raise RuntimeError(
+                    f"[cropped_mask] Ожидался torch.Tensor, получено: {type(cropped_mask)}"
+                )
 
-            if cropped_mask.dim() == 3: # BxHxW
+            if cropped_mask.dim() == 3:  # BxHxW
                 if cropped_mask.shape[0] != 1:
-                    raise RuntimeError(f"[cropped_mask] Ожидалась одна маска (batch=1), получено: {cropped_mask.shape[0]}")
+                    raise RuntimeError(
+                        f"[cropped_mask] Ожидалась одна маска (batch=1), получено: {cropped_mask.shape[0]}"
+                    )
                 mask = cropped_mask.squeeze(0)
-            elif cropped_mask.dim() == 2: # HxW
+            elif cropped_mask.dim() == 2:  # HxW
                 mask = cropped_mask
             else:
-                raise RuntimeError(f"[cropped_mask] Ожидался тензор HxW или BxHxW, получено: {tuple(cropped_mask.shape)}")
+                raise RuntimeError(
+                    f"[cropped_mask] Ожидался тензор HxW или BxHxW, получено: {tuple(cropped_mask.shape)}"
+                )
 
             mask = mask.to(dtype=torch.float32)
 
