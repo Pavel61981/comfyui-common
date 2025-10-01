@@ -42,11 +42,6 @@ ALLOWED_BODY_MODELS = {
     "yolov8m-seg.pt",
     "yolov8l-seg.pt",
     "yolov8x-seg.pt",
-    "yolov12n-seg.pt",
-    "yolov12s-seg.pt",
-    "yolov12m-seg.pt",
-    "yolov12l-seg.pt",
-    "yolov12x-seg.pt",
 }
 
 
@@ -62,16 +57,6 @@ def _resolve_device(name: str) -> str:
         logger.warning(f"Запрошен {name}, но CUDA недоступна. Переключаемся на cpu.")
         return "cpu"
     return name
-
-
-def _set_model_precision(yolo_model) -> None:
-    try:
-        m = getattr(yolo_model, "model", None)
-        if m is not None:
-            m.to(dtype=torch.float32)
-            logger.info("Модель приведена к dtype=float32")
-    except Exception as e:
-        logger.warning(f"Не удалось установить dtype=float32: {e}")
 
 
 def _cleanup_model(model, device: str) -> None:
@@ -163,7 +148,7 @@ class ImageBodyDetect:
         return {
             "required": {"image": ("IMAGE",)},
             "optional": {
-                "device": (["auto", "cpu", "cuda:0"], {"default": "auto"}),
+                "device": (["auto", "cpu", "cuda:0"], {"default": "cpu"}),
                 "body_model": (
                     list(sorted(ALLOWED_BODY_MODELS)),
                     {"default": "yolov8m-seg.pt"},
@@ -239,7 +224,13 @@ class ImageBodyDetect:
         H, W = img.shape[:2]
         try:
             results = model.predict(
-                source=img, conf=conf, iou=0.45, max_det=20, classes=[0], verbose=False
+                source=img,
+                conf=conf,
+                iou=0.45,
+                max_det=20,
+                classes=[0],
+                verbose=False,
+                # imgsz=1280,
             )
         except Exception as e:
             raise RuntimeError(f"YOLO predict failed: {e}") from e
