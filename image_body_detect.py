@@ -6,66 +6,89 @@ from typing import List, Tuple
 import cv2
 import numpy as np
 import torch
+import logging
+
+# ------------------------------------------------------------
+# ОТКЛЮЧЕНИЕ СЕТЕВЫХ ПРОВЕРОК ULTRALYTICS
+# Это предотвращает долгие задержки при инициализации модели
+# ------------------------------------------------------------
+try:
+    from ultralytics.utils import SETTINGS
+
+    SETTINGS.update({"HUB": False, "VERBOSE": False})
+    # Это сообщение будет видно в консоли при запуске ComfyUI
+    print(
+        "[ImageBodyDetect] Ultralytics HUB/update checks disabled for faster startup."
+    )
+except Exception as e:
+    print(f"[ImageBodyDetect] Warning: Failed to disable Ultralytics HUB checks: {e}")
 
 
-def yolo_body_models_dir() -> str:
-    """
-    Путь для весов тел: <ComfyUI>/models/yolo-body, иначе — локально: ./models/yolo-body
-    """
-    try:
-        from folder_paths import models_dir  # type: ignore
-
-        if isinstance(models_dir, str) and os.path.isdir(models_dir):
-            root = os.path.join(models_dir, "yolo-body")
-            os.makedirs(root, exist_ok=True)
-            return root
-    except Exception:
-        pass
-    here = os.path.dirname(os.path.abspath(__file__))
-    root = os.path.join(here, "models", "yolo-body")
-    os.makedirs(root, exist_ok=True)
-    return root
+# ------------------------------------------------------------
+# ЛОГИРОВАНИЕ
+# ------------------------------------------------------------
+LOGGER_NAME = "ImageBodyDetect"
+logger = logging.getLogger(LOGGER_NAME)
+if not logger.handlers:
+    handler = logging.StreamHandler()
+    formatter = logging.Formatter("[%(name)s] %(levelname)s: %(message)s")
+    handler.setFormatter(formatter)
+    logger.addHandler(handler)
+logger.setLevel(logging.INFO)
 
 
+# ------------------------------------------------------------
+# МОДЕЛИ
+# ------------------------------------------------------------
+ALLOWED_BODY_MODELS = {
+    "yolov8n-seg.pt",
+    "yolov8s-seg.pt",
+    "yolov8m-seg.pt",
+    "yolov8l-seg.pt",
+    "yolov8x-seg.pt",
+}
+
+
+# ------------------------------------------------------------
+# ХЕЛПЕРЫ
+# ------------------------------------------------------------
 def _resolve_device(name: str) -> str:
     if name == "auto":
-        return "cuda:0" if torch.cuda.is_available() else "cpu"
+        dev = "cuda:0" if torch.cuda.is_available() else "cpu"
+        logger.info(f"Выбран device=auto → {dev}")
+        return dev
+    if name.startswith("cuda") and not torch.cuda.is_available():
+        logger.warning(f"Запрошен {name}, но CUDA недоступна. Переключаемся на cpu.")
+        return "cpu"
     return name
 
 
 def _set_model_precision(yolo_model) -> None:
     try:
         m = getattr(yolo_model, "model", None)
-        if m is None:
-            return
-
-        m.to(dtype=torch.float32)
-    except Exception:
-        pass
+        if m is not None:
+            m.to(dtype=torch.float32)
+            logger.info("Модель приведена к dtype=float32")
+    except Exception as e:
+        logger.warning(f"Не удалось установить dtype=float32: {e}")
 
 
 def _cleanup_model(model, device: str) -> None:
-    """
-    Аккуратно освобождает память модели (CPU/GPU).
-    Без глобальных кэшей.
-    """
+    """Аккуратно освобождает память модели (CPU/GPU)."""
     try:
         m = getattr(model, "model", None)
         if m is not None:
-            try:
-                m.to("cpu")
-            except Exception:
-                pass
+            m.to("cpu")
+    except Exception as e:
+        logger.debug(f"Не удалось перенести модель на CPU при очистке: {e}")
     finally:
-        try:
-            del model
-        except Exception:
-            pass
+        del model
         if device.startswith("cuda") and torch.cuda.is_available():
             try:
                 torch.cuda.empty_cache()
-            except Exception:
-                pass
+                logger.info("CUDA cache очищен")
+            except Exception as e:
+                logger.debug(f"torch.cuda.empty_cache() ошибка: {e}")
 
 
 def _clip_int(v: int, lo: int, hi: int) -> int:
@@ -88,61 +111,30 @@ def _np_image_to_tensor(img: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
 
 
-def _np_mask_to_tensor(mask_u8: np.ndarray) -> torch.Tensor:
-    m = (mask_u8.astype(np.float32) / 255.0)[np.newaxis, ...]
-    return torch.from_numpy(m)
-
-
 def _postprocess_mask(mask_u8: np.ndarray, pad_px: int, blur_r: int) -> np.ndarray:
-    """
-    Базовая морфология + паддинг маски + опциональный GaussianBlur.
-
-    Порядок: close(3x3 эллипс) -> dilate(3x3 эллипс) -> padding (±px, эллипс ядро) -> blur.
-    """
     if mask_u8 is None or mask_u8.size == 0:
         return mask_u8
-
     try:
         m = mask_u8
         if m.dtype != np.uint8:
             m = m.astype(np.uint8, copy=False)
-
-        # Базовая морфология (как было)
         kern_base = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
         m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kern_base)
         m = cv2.morphologyEx(m, cv2.MORPH_DILATE, kern_base)
-
-        # Паддинг маски (расширение/сужение) — эллиптическим ядром (2*abs(pad)+1)
-        if isinstance(pad_px, (int, np.integer)) and pad_px != 0:
+        if isinstance(pad_px, int) and pad_px != 0:
             k = int(abs(pad_px))
-            # ограничение ядра: не меньше 1 и нечетное
             ksize = max(1, 2 * k + 1)
             kern_pad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
             if pad_px > 0:
                 m = cv2.dilate(m, kern_pad, iterations=1)
             else:
                 m = cv2.erode(m, kern_pad, iterations=1)
-
-        # Размытие краев
-        if isinstance(blur_r, (int, np.integer)) and blur_r > 0:
+        if isinstance(blur_r, int) and blur_r > 0:
             ksize = 2 * int(blur_r) + 1
             m = cv2.GaussianBlur(m, (ksize, ksize), 0)
-
         return m
     except Exception:
-        # в случае любой ошибки — вернуть исходную маску
         return mask_u8
-
-
-def _area_polys_fast(polys: List[np.ndarray]) -> float:
-    area = 0.0
-    for p in polys:
-        if p is None or len(p) < 3:
-            continue
-        x = p[:, 0].astype(np.float64)
-        y = p[:, 1].astype(np.float64)
-        area += 0.5 * abs(np.dot(x, np.roll(y, -1)) - np.dot(y, np.roll(x, -1)))
-    return float(area)
 
 
 def _rasterize_polygons(polys: List[np.ndarray], h: int, w: int) -> np.ndarray:
@@ -161,28 +153,15 @@ def _mask_from_bbox(h: int, w: int, bbox: Tuple[int, int, int, int]) -> np.ndarr
 
 
 def _masks_to_image_batch(masks_u8: List[np.ndarray], h: int, w: int) -> torch.Tensor:
-    """
-    Конвертирует список HxW (uint8 0/255) в батч IMAGE: (B,H,W,3) float32 [0..1].
-    Если список пуст — возвращает один нулевой кадр.
-    """
     if not masks_u8:
-        z = np.zeros((1, h, w, 3), dtype=np.float32)
-        return torch.from_numpy(z)
-    stack = np.stack(
-        [(m.astype(np.float32) / 255.0) for m in masks_u8], axis=0
-    )  # (B,H,W)
-    stack = stack[..., np.newaxis]  # (B,H,W,1)
-    stack = np.repeat(stack, 3, axis=3)  # (B,H,W,3)
+        return torch.from_numpy(np.zeros((1, h, w, 3), dtype=np.float32))
+    stack = np.stack([(m.astype(np.float32) / 255.0) for m in masks_u8], axis=0)
+    stack = stack[..., np.newaxis]
+    stack = np.repeat(stack, 3, axis=3)
     return torch.from_numpy(stack)
 
 
 class ImageBodyDetect:
-    """
-    Детекция тел (YOLOv8-seg, класс person).
-    Возвращает bbox тел, батч масок (IMAGE) и debug-изображение.
-    Без кэширования моделей; освобождение памяти после использования.
-    """
-
     @classmethod
     def INPUT_TYPES(cls):
         return {
@@ -190,7 +169,7 @@ class ImageBodyDetect:
             "optional": {
                 "device": (["auto", "cpu", "cuda:0"], {"default": "auto"}),
                 "body_model": (
-                    ["yolov8n-seg.pt", "yolov8s-seg.pt", "yolov8m-seg.pt"],
+                    list(sorted(ALLOWED_BODY_MODELS)),
                     {"default": "yolov8m-seg.pt"},
                 ),
                 "conf": (
@@ -216,66 +195,40 @@ class ImageBodyDetect:
             },
         }
 
-    RETURN_TYPES = (
-        "IMAGE",  # IMAGE (исходник)
-        "BBOX_LIST",  # BODY_BBOXES
-        "IMAGE",  # BODY_MASKS (батч IMAGE: B×H×W×3)
-        "BOOLEAN",  # FOUND_BODY
-        "IMAGE",  # DEBUG_IMAGE
-    )
-    RETURN_NAMES = (
-        "IMAGE",
-        "BODY_BBOXES",
-        "BODY_MASKS",
-        "FOUND_BODY",
-        "DEBUG_IMAGE",
-    )
+    RETURN_TYPES = ("IMAGE", "BBOX_LIST", "IMAGE", "BOOLEAN", "IMAGE")
+    RETURN_NAMES = ("IMAGE", "BODY_BBOXES", "BODY_MASKS", "FOUND_BODY", "DEBUG_IMAGE")
     FUNCTION = "execute"
     CATEGORY = "Masquerade/Detect"
     OUTPUT_NODE = False
 
     def _get_ultra(self):
         try:
-            from ultralytics import YOLO  # type: ignore
+            from ultralytics import YOLO
+
+            return YOLO
         except Exception as e:
             raise RuntimeError(
-                f"[ImageBodyDetect] ultralytics not installed: {e}"
+                f"[ImageBodyDetect] Ultralytics не установлен: {e}"
             ) from e
-        return YOLO
 
     def _load_body_model(self, model_name: str, device: str):
-        """
-        Ищет веса в <ComfyUI>/models/yolo-body и рядом с файлом, иначе даёт Ultralytics скачать.
-        """
+        if model_name not in ALLOWED_BODY_MODELS:
+            raise RuntimeError(f"Некорректное имя модели: {model_name}")
+
         YOLO = self._get_ultra()
-        candidates = []
-        body_dir = yolo_body_models_dir()
-        local_path = os.path.join(body_dir, model_name)
-        if os.path.isfile(local_path):
-            candidates.append(local_path)
-        here = os.path.dirname(os.path.abspath(__file__))
-        near_path = os.path.join(here, model_name)
-        if os.path.isfile(near_path):
-            candidates.append(near_path)
-
-        last_err = None
-        for cand in candidates + [model_name]:
-            try:
-                model = YOLO(cand)
-                model.to(device)
-                _set_model_precision(model)
-                return model
-            except Exception as e:
-                last_err = e
-                continue
-
-        raise RuntimeError(
-            "[ImageBodyDetect] Failed to load body model "
-            f"'{model_name}'. Ensure Ultralytics can auto-download it, or place the file here:\n"
-            f" - {os.path.join(yolo_body_models_dir(), model_name)}\n"
-            f" - {os.path.join(os.path.dirname(os.path.abspath(__file__)), model_name)}\n"
-            f"Last error: {last_err}"
-        )
+        logger.info(f"Загрузка модели '{model_name}'...")
+        try:
+            model = YOLO(model_name)
+            model.to(device)
+            _set_model_precision(model)
+            logger.info(
+                f"Модель '{model_name}' успешно загружена на устройство '{device}'."
+            )
+            return model
+        except Exception as e:
+            raise RuntimeError(
+                f"Не удалось загрузить/скачать модель '{model_name}'. Ошибка: {e}"
+            ) from e
 
     def _detect_bodies(
         self,
@@ -285,69 +238,30 @@ class ImageBodyDetect:
         thr_area: float,
         mask_padding_px: int,
         mask_blur_radius: int,
-    ) -> Tuple[
-        List[np.ndarray],
-        List[Tuple[int, int, int, int]],
-        List[Tuple[int, int, int, int]],
-    ]:
-        """
-        Возвращает (accepted_masks_u8, accepted_bboxes_xywh, rejected_bboxes_xywh)
-        """
+    ):
         H, W = img.shape[:2]
         try:
             results = model.predict(
-                source=img,
-                conf=conf,
-                iou=0.45,
-                max_det=20,
-                classes=[0],  # person
-                verbose=False,
-                device=None,  # модель уже на девайсе
+                source=img, conf=conf, iou=0.45, max_det=20, classes=[0], verbose=False
             )
         except Exception as e:
-            raise RuntimeError(
-                f"[ImageBodyDetect] YOLO body predict failed: {e}"
-            ) from e
+            raise RuntimeError(f"YOLO predict failed: {e}") from e
 
         r = results[0] if results else None
-        accepted_masks: List[np.ndarray] = []
-        accepted_bboxes: List[Tuple[int, int, int, int]] = []
-        rejected_bboxes: List[Tuple[int, int, int, int]] = []
-
+        accepted_masks, accepted_bboxes, rejected_bboxes = [], [], []
         if r is None:
             return accepted_masks, accepted_bboxes, rejected_bboxes
 
-        # Boxes
-        try:
-            xyxy = (
-                r.boxes.xyxy.detach().cpu().numpy().astype(np.float32)
-                if getattr(r, "boxes", None) is not None
-                else np.zeros((0, 4), dtype=np.float32)
-            )
-        except Exception:
-            xyxy = np.zeros((0, 4), dtype=np.float32)
-
-        # Masks: prefer tensor data (faster), else polygons
-        masks_data = None
-        if getattr(r, "masks", None) is not None:
-            try:
-                masks_data = getattr(r.masks, "data", None)  # torch.Tensor [N,h,w]
-            except Exception:
-                masks_data = None
-
-        polys_src = []
-        if masks_data is None:
-            try:
-                polys_src = (
-                    r.masks.xy
-                    if (
-                        getattr(r, "masks", None) is not None
-                        and getattr(r.masks, "xy", None) is not None
-                    )
-                    else []
-                )
-            except Exception:
-                polys_src = []
+        xyxy = (
+            r.boxes.xyxy.detach().cpu().numpy()
+            if getattr(r, "boxes", None) is not None
+            else np.zeros((0, 4))
+        )
+        masks_data = (
+            getattr(r.masks, "data", None)
+            if getattr(r, "masks", None) is not None
+            else None
+        )
 
         for i in range(xyxy.shape[0]):
             x1f, y1f, x2f, y2f = xyxy[i]
@@ -360,49 +274,15 @@ class ImageBodyDetect:
                 continue
 
             bbox = (x1, y1, bw, bh)
-            bbox_area = float(bw * bh)
-            if bbox_area < thr_area:
+            if float(bw * bh) < thr_area:
                 rejected_bboxes.append(bbox)
                 continue
 
             raw_mask = None
-            if masks_data is not None:
-                try:
-                    md = masks_data[i]
-                    mu8 = (md.detach().float().cpu().numpy() >= 0.5).astype(
-                        np.uint8
-                    ) * 255
-                    mu8 = cv2.resize(mu8, (W, H), interpolation=cv2.INTER_NEAREST)
-                    if float((mu8 > 0).sum()) < thr_area:
-                        rejected_bboxes.append(bbox)
-                        continue
-                    raw_mask = mu8
-                except Exception:
-                    raw_mask = None
-
-            if raw_mask is None and polys_src:
-                polys_int: List[np.ndarray] = []
-                if i < len(polys_src) and polys_src[i] is not None:
-                    p = polys_src[i]
-                    if isinstance(p, list):
-                        for pp in p:
-                            if pp is None or len(pp) < 3:
-                                continue
-                            arr = np.asarray(pp, dtype=np.float32)
-                            arr[:, 0] = np.clip(arr[:, 0], 0, W - 1)
-                            arr[:, 1] = np.clip(arr[:, 1], 0, H - 1)
-                            polys_int.append(arr.astype(np.int32))
-                    else:
-                        arr = np.asarray(p, dtype=np.float32)
-                        if arr.ndim == 2 and arr.shape[0] >= 3:
-                            arr[:, 0] = np.clip(arr[:, 0], 0, W - 1)
-                            arr[:, 1] = np.clip(arr[:, 1], 0, H - 1)
-                            polys_int.append(arr.astype(np.int32))
-                if polys_int:
-                    if _area_polys_fast(polys_int) < thr_area:
-                        rejected_bboxes.append(bbox)
-                        continue
-                    raw_mask = _rasterize_polygons(polys_int, H, W)
+            if masks_data is not None and i < len(masks_data):
+                md = masks_data[i]
+                mu8 = (md.detach().float().cpu().numpy() >= 0.5).astype(np.uint8) * 255
+                raw_mask = cv2.resize(mu8, (W, H), interpolation=cv2.INTER_NEAREST)
 
             if raw_mask is None:
                 raw_mask = _mask_from_bbox(H, W, bbox)
@@ -416,37 +296,34 @@ class ImageBodyDetect:
         order = sorted(range(len(accepted_bboxes)), key=lambda j: accepted_bboxes[j][0])
         accepted_masks = [accepted_masks[j] for j in order]
         accepted_bboxes = [accepted_bboxes[j] for j in order]
+        logger.info(
+            f"Детекций принято: {len(accepted_bboxes)}, отклонено: {len(rejected_bboxes)}"
+        )
         return accepted_masks, accepted_bboxes, rejected_bboxes
 
     def execute(
         self,
         image: torch.Tensor,
-        device: str = "auto",
-        conf: float = 0.25,
-        mask_blur_radius: int = 0,
-        debug_bbox_thickness: int = 6,
-        body_model: str = "yolov8s-seg.pt",
-        body_min_component_percent: float = 10.0,
-        mask_padding_px: int = 0,
+        device: str,
+        conf: float,
+        mask_blur_radius: int,
+        debug_bbox_thickness: int,
+        body_model: str,
+        body_min_component_percent: float,
+        mask_padding_px: int,
     ):
-        # --- вход ---
-        try:
-            img = _tensor_to_np_image(image)
-        except Exception as e:
-            raise RuntimeError(f"[ImageBodyDetect] Invalid IMAGE tensor: {e}") from e
 
+        img = _tensor_to_np_image(image)
         H, W = img.shape[:2]
-        frame_area = float(W * H)
-        thr_body_area = max(0.0, float(body_min_component_percent)) / 100.0 * frame_area
+        thr_body_area = (float(body_min_component_percent) / 100.0) * (W * H)
+        logger.info(
+            f"Порог площади тела: {body_min_component_percent:.2f}% → {thr_body_area:.1f} пикс."
+        )
 
-        # --- девайс ---
         dev = _resolve_device(device)
-
-        # --- модель ---
         model_body = self._load_body_model(body_model, dev)
 
         try:
-            # --- тела ---
             body_masks_u8, body_bboxes_xywh, rejected_body_bboxes = self._detect_bodies(
                 img=img,
                 model=model_body,
@@ -456,55 +333,49 @@ class ImageBodyDetect:
                 mask_blur_radius=mask_blur_radius,
             )
         finally:
+            # Освобождаем VRAM после каждого запуска
             _cleanup_model(model_body, dev)
 
         found_body = len(body_bboxes_xywh) > 0
-
-        # --- конвертация масок в батч IMAGE ---
         body_masks_batch = _masks_to_image_batch(body_masks_u8, H, W)
-        body_bboxes_list = [
-            [int(x), int(y), int(w), int(h)] for (x, y, w, h) in body_bboxes_xywh
-        ]
+        body_bboxes_list = [[int(v) for v in box] for box in body_bboxes_xywh]
 
-        # --- DEBUG ---
+        # DEBUG-изображение
         debug = img.copy()
-        overlay = np.zeros_like(debug)
-
         if body_masks_u8:
-            mb = np.any(np.stack([m > 0 for m in body_masks_u8], axis=0), axis=0)
-            overlay[mb] = [0, 0, 255]  # синий (BGR)
+            combined_mask = np.any(
+                np.stack([m > 0 for m in body_masks_u8], axis=0), axis=0
+            )
+            overlay = np.zeros_like(debug)
+            overlay[combined_mask] = [0, 0, 255]  # Синий
+            debug = cv2.addWeighted(overlay, 0.35, debug, 0.65, 0)
 
-        debug = cv2.addWeighted(overlay, 0.35, debug, 0.65, 0)
-
-        t = int(max(1, min(10, debug_bbox_thickness)))
-        # тела — жёлтые
-        for i, (x, y, w_, h_) in enumerate(body_bboxes_xywh):
-            x2, y2 = x + w_, y + h_
-            cv2.rectangle(debug, (x, y), (x2, y2), (0, 255, 255), thickness=t)
+        t = int(max(1, debug_bbox_thickness))
+        # Принятые тела - желтые
+        for i, (x, y, w, h) in enumerate(body_bboxes_xywh):
+            cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 255, 255), t)
             cv2.putText(
                 debug,
                 f"Person #{i}",
-                (x + 5, max(15, y + 15)),
+                (x + 5, y + 20),
                 cv2.FONT_HERSHEY_SIMPLEX,
-                0.5,
+                0.6,
                 (0, 255, 255),
-                1,
+                2,
                 cv2.LINE_AA,
             )
-
-        # отклонённые тела — красные перечёркнутые
-        for x, y, w_, h_ in rejected_body_bboxes:
-            x2, y2 = x + w_, y + h_
-            cv2.rectangle(debug, (x, y), (x2, y2), (0, 0, 255), thickness=t)
-            cv2.line(debug, (x, y), (x2, y2), (0, 0, 255), thickness=t)
-            cv2.line(debug, (x2, y), (x, y2), (0, 0, 255), thickness=t)
+        # Отклоненные тела - красные, перечеркнутые
+        for x, y, w, h in rejected_body_bboxes:
+            cv2.rectangle(debug, (x, y), (x + w, y + h), (0, 0, 255), t)
+            cv2.line(debug, (x, y), (x + w, y + h), (0, 0, 255), t)
+            cv2.line(debug, (x + w, y), (x, y + h), (0, 0, 255), t)
 
         return (
-            _np_image_to_tensor(img),  # IMAGE
-            body_bboxes_list,  # BODY_BBOXES
-            body_masks_batch,  # BODY_MASKS (IMAGE батч)
-            bool(found_body),  # FOUND_BODY
-            _np_image_to_tensor(debug),  # DEBUG_IMAGE
+            _np_image_to_tensor(img),
+            body_bboxes_list,
+            body_masks_batch,
+            bool(found_body),
+            _np_image_to_tensor(debug),
         )
 
 
