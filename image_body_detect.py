@@ -137,13 +137,6 @@ def _postprocess_mask(mask_u8: np.ndarray, pad_px: int, blur_r: int) -> np.ndarr
         return mask_u8
 
 
-def _rasterize_polygons(polys: List[np.ndarray], h: int, w: int) -> np.ndarray:
-    mask = np.zeros((h, w), dtype=np.uint8)
-    if polys:
-        cv2.fillPoly(mask, pts=polys, color=255)
-    return mask
-
-
 def _mask_from_bbox(h: int, w: int, bbox: Tuple[int, int, int, int]) -> np.ndarray:
     x, y, bw, bh = bbox
     m = np.zeros((h, w), dtype=np.uint8)
@@ -220,7 +213,7 @@ class ImageBodyDetect:
         try:
             model = YOLO(model_name)
             model.to(device)
-            _set_model_precision(model)
+            # _set_model_precision(model)
             logger.info(
                 f"Модель '{model_name}' успешно загружена на устройство '{device}'."
             )
