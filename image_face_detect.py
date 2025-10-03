@@ -8,6 +8,18 @@ import cv2
 import numpy as np
 import torch
 
+# ------------------------------------------------------------
+# ОТКЛЮЧЕНИЕ СЕТЕВЫХ ПРОВЕРОК ULTRALYTICS
+# ------------------------------------------------------------
+try:
+    from ultralytics.utils import SETTINGS
+
+    SETTINGS.update({"HUB": False, "VERBOSE": False})
+    print(
+        "[ImageFaceDetect] Ultralytics HUB/update checks disabled for faster startup."
+    )
+except Exception as e:
+    print(f"[ImageFaceDetect] Warning: Failed to disable Ultralytics HUB checks: {e}")
 
 YOLO_FACE_URLS = {
     "yolov12n-face.pt": "https://github.com/YapaLab/yolo-face/releases/download/v0.0.0/yolov12n-face.pt",
@@ -73,16 +85,6 @@ def _resolve_device(name: str) -> str:
     return name
 
 
-def _set_model_precision(yolo_model) -> None:
-    try:
-        m = getattr(yolo_model, "model", None)
-        if m is None:
-            return
-        m.to(dtype=torch.float32)
-    except Exception:
-        pass
-
-
 def _cleanup_model(model, device: str) -> None:
     """
     Аккуратно освобождает память модели (CPU/GPU).
@@ -127,103 +129,19 @@ def _np_image_to_tensor(img: np.ndarray) -> torch.Tensor:
     return torch.from_numpy(img.astype(np.float32) / 255.0).unsqueeze(0)
 
 
-def _np_mask_to_tensor(mask_u8: np.ndarray) -> torch.Tensor:
-    m = (mask_u8.astype(np.float32) / 255.0)[np.newaxis, ...]
-    return torch.from_numpy(m)
-
-
-def _postprocess_mask(mask_u8: np.ndarray, pad_px: int, blur_r: int) -> np.ndarray:
+# --------- НОВОЕ: батч MASK в стиле ImageFaceDetect ---------
+def _masks_to_mask_batch(masks_u8: List[np.ndarray], h: int, w: int) -> torch.Tensor:
     """
-    Базовая морфология + паддинг маски + опциональный GaussianBlur.
-    Порядок: close(3x3 эллипс) -> dilate(3x3 эллипс) -> padding(±px, эллипс ядро) -> blur.
-    """
-    if mask_u8 is None or mask_u8.size == 0:
-        return mask_u8
-
-    try:
-        m = mask_u8
-        if m.dtype != np.uint8:
-            m = m.astype(np.uint8, copy=False)
-
-        kern_base = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
-        m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kern_base)
-        m = cv2.morphologyEx(m, cv2.MORPH_DILATE, kern_base)
-
-        if isinstance(pad_px, (int, np.integer)) and pad_px != 0:
-            k = int(abs(pad_px))
-            ksize = max(1, 2 * k + 1)  # нечетный размер
-            kern_pad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
-            if pad_px > 0:
-                m = cv2.dilate(m, kern_pad, iterations=1)
-            else:
-                m = cv2.erode(m, kern_pad, iterations=1)
-
-        if isinstance(blur_r, (int, np.integer)) and blur_r > 0:
-            ksize = 2 * int(blur_r) + 1
-            m = cv2.GaussianBlur(m, (ksize, ksize), 0)
-
-        return m
-    except Exception:
-        # в случае ошибки вернём изначальную маску
-        return mask_u8
-
-
-def _iou_xywh(a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]) -> float:
-    ax, ay, aw, ah = a
-    bx, by, bw, bh = b
-    ax2, ay2 = ax + aw, ay + ah
-    bx2, by2 = bx + bw, by + bh
-    ix1, iy1 = max(ax, bx), max(ay, by)
-    ix2, iy2 = min(ax2, bx2), min(ay2, by2)
-    iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
-    inter = iw * ih
-    union = aw * ah + bw * bh - inter
-    return float(inter) / float(union) if union > 0 else 0.0
-
-
-def _nms_by_iou_xywh(
-    boxes: List[Tuple[int, int, int, int]],
-    masks: List[np.ndarray],
-    iou_thr: float = 0.6,
-) -> Tuple[List[Tuple[int, int, int, int]], List[np.ndarray]]:
-    """
-    Жадный NMS по IoU для XYWH. Критерий — сортировка по убыванию площади.
-    """
-    if not boxes:
-        return boxes, masks
-    areas = [b[2] * b[3] for b in boxes]
-    order = sorted(range(len(boxes)), key=lambda i: areas[i], reverse=True)
-    keep_idx = []
-    suppressed = [False] * len(order)
-    for oi, i in enumerate(order):
-        if suppressed[oi]:
-            continue
-        keep_idx.append(i)
-        bi = boxes[i]
-        for oj, j in enumerate(order[oi + 1 :], start=oi + 1):
-            if suppressed[oj]:
-                continue
-            if _iou_xywh(bi, boxes[j]) > iou_thr:
-                suppressed[oj] = True
-    kept_boxes = [boxes[i] for i in keep_idx]
-    kept_masks = [masks[i] for i in keep_idx]
-    return kept_boxes, kept_masks
-
-
-def _masks_to_image_batch(masks_u8: List[np.ndarray], h: int, w: int) -> torch.Tensor:
-    """
-    Конвертирует список HxW (uint8 0/255) в батч IMAGE: (B,H,W,3) float32 [0..1].
-    Если список пуст — возвращает один нулевой кадр.
+    Формирует батч масок формата ComfyUI MASK: [B, H, W], float32 в [0..1].
+    Если детекций нет — возвращает нулевую маску [1, H, W].
     """
     if not masks_u8:
-        z = np.zeros((1, h, w, 3), dtype=np.float32)
-        return torch.from_numpy(z)
-    stack = np.stack(
-        [(m.astype(np.float32) / 255.0) for m in masks_u8], axis=0
-    )  # (B,H,W)
-    stack = stack[..., np.newaxis]  # (B,H,W,1)
-    stack = np.repeat(stack, 3, axis=3)  # (B,H,W,3)
+        return torch.from_numpy(np.zeros((1, h, w), dtype=np.float32))
+    stack = np.stack([(m.astype(np.float32) / 255.0) for m in masks_u8], axis=0)
     return torch.from_numpy(stack)
+
+
+# ------------------------------------------------------------
 
 
 def _pad_crops_to_batch(
@@ -287,12 +205,12 @@ def _draw_dashed_rect(
 class ImageFaceDetect:
     """
     Детекция лиц (YOLO-face).
+
     Режимы:
       • BODY_BBOXES непустой → одно лицо на тело (самое крупное в ROI), глобальный NMS.
       • BODY_BBOXES пустой/нет → детекция по всему кадру, берём все лица (после порога площади и NMS).
-    Маска лица — заполненный овал по bbox. Дополнительно: кропы лиц и общий кроп всех лиц с паддингом.
-
-    Параметр fp16_infer удалён. Добавлен параметр mask_padding_px.
+    Маска лица — заполненный овал по bbox, затем постобработка (close→dilate→padding→blur).
+    Дополнительно: кропы лиц и общий кроп всех лиц с паддингом.
     """
 
     @classmethod
@@ -347,7 +265,7 @@ class ImageFaceDetect:
     RETURN_TYPES = (
         "IMAGE",  # IMAGE (исходник)
         "BBOX_LIST",  # FACE_BBOXES
-        "IMAGE",  # FACE_MASKS (батч IMAGE: B×H×W×3)
+        "MASK",  # FACE_MASKS (батч MASK: B×H×W)
         "BOOLEAN",  # FOUND_FACE
         "IMAGE",  # DEBUG_IMAGE
         "IMAGE",  # FACE_CROPS (батч кропов лиц, pad-to-max)
@@ -413,12 +331,88 @@ class ImageFaceDetect:
         try:
             model = YOLO(local_path)
             model.to(device)
-            _set_model_precision(model)
             return model
         except Exception as e:
             raise RuntimeError(
                 f"[ImageFaceDetect] Failed to load face model '{model_name}' from '{local_path}': {e}"
             ) from e
+
+    def _postprocess_mask(
+        self, mask_u8: np.ndarray, pad_px: int, blur_r: int
+    ) -> np.ndarray:
+        """
+        Базовая морфология + паддинг маски + опциональный GaussianBlur.
+        Порядок: close(3x3 эллипс) -> dilate(3x3 эллипс) -> padding(±px, эллипс ядро) -> blur.
+        Возвращает uint8 [0..255]; при блюре сохраняются полутона.
+        """
+        if mask_u8 is None or mask_u8.size == 0:
+            return mask_u8
+        try:
+            m = mask_u8
+            if m.dtype != np.uint8:
+                m = m.astype(np.uint8, copy=False)
+            kern_base = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (3, 3))
+            m = cv2.morphologyEx(m, cv2.MORPH_CLOSE, kern_base)
+            m = cv2.morphologyEx(m, cv2.MORPH_DILATE, kern_base)
+            if isinstance(pad_px, int) and pad_px != 0:
+                k = int(abs(pad_px))
+                ksize = max(1, 2 * k + 1)
+                kern_pad = cv2.getStructuringElement(cv2.MORPH_ELLIPSE, (ksize, ksize))
+                if pad_px > 0:
+                    m = cv2.dilate(m, kern_pad, iterations=1)
+                else:
+                    m = cv2.erode(m, kern_pad, iterations=1)
+            if isinstance(blur_r, int) and blur_r > 0:
+                ksize = 2 * int(blur_r) + 1
+                m = cv2.GaussianBlur(m, (ksize, ksize), 0)
+            return m
+        except Exception:
+            return mask_u8
+
+    # ------------------------------------------------------------
+
+    def _iou_xywh(
+        self, a: Tuple[int, int, int, int], b: Tuple[int, int, int, int]
+    ) -> float:
+        ax, ay, aw, ah = a
+        bx, by, bw, bh = b
+        ax2, ay2 = ax + aw, ay + ah
+        bx2, by2 = bx + bw, by + bh
+        ix1, iy1 = max(ax, bx), max(ay, by)
+        ix2, iy2 = min(ax2, bx2), min(ay2, by2)
+        iw, ih = max(0, ix2 - ix1), max(0, iy2 - iy1)
+        inter = iw * ih
+        union = aw * ah + bw * bh - inter
+        return float(inter) / float(union) if union > 0 else 0.0
+
+    def _nms_by_iou_xywh(
+        self,
+        boxes: List[Tuple[int, int, int, int]],
+        masks: List[np.ndarray],
+        iou_thr: float = 0.6,
+    ) -> Tuple[List[Tuple[int, int, int, int]], List[np.ndarray]]:
+        """
+        Жадный NMS по IoU для XYWH. Критерий — сортировка по убыванию площади.
+        """
+        if not boxes:
+            return boxes, masks
+        areas = [b[2] * b[3] for b in boxes]
+        order = sorted(range(len(boxes)), key=lambda i: areas[i], reverse=True)
+        keep_idx = []
+        suppressed = [False] * len(order)
+        for oi, i in enumerate(order):
+            if suppressed[oi]:
+                continue
+            keep_idx.append(i)
+            bi = boxes[i]
+            for oj, j in enumerate(order[oi + 1 :], start=oi + 1):
+                if suppressed[oj]:
+                    continue
+                if self._iou_xywh(bi, boxes[j]) > iou_thr:
+                    suppressed[oj] = True
+        kept_boxes = [boxes[i] for i in keep_idx]
+        kept_masks = [masks[i] for i in keep_idx]
+        return kept_boxes, kept_masks
 
     def _detect_faces_for_bodies(
         self,
@@ -448,8 +442,7 @@ class ImageFaceDetect:
         if not body_bboxes:
             return [], [], []
 
-        # Подготовка ROI по телам (+процентный pad только для детекции),
-        # и параллельный список площадей тел (bw*bh) для порогов.
+        # Подготовка ROI + площади тел
         rois: List[Optional[np.ndarray]] = []
         roi_rects: List[Tuple[int, int, int, int]] = []
         roi_body_areas: List[float] = []
@@ -461,18 +454,15 @@ class ImageFaceDetect:
                     min(max(0, bw), max(0, bh)) * max(0.0, float(pad_percent)) / 100.0
                 )
             )
-
             rx1 = _clip_int(bx - pad, 0, W - 1)
             ry1 = _clip_int(by - pad, 0, H - 1)
             rx2 = _clip_int(bx + bw + pad, 0, W)
             ry2 = _clip_int(by + bh + pad, 0, H)
-
             if rx2 <= rx1 or ry2 <= ry1:
                 rois.append(None)
                 roi_rects.append((0, 0, 0, 0))
                 roi_body_areas.append(0.0)
                 continue
-
             rois.append(img[ry1:ry2, rx1:rx2, :])
             roi_rects.append((rx1, ry1, rx2, ry2))
             roi_body_areas.append(body_area)
@@ -486,9 +476,10 @@ class ImageFaceDetect:
                 source=batched_inputs,
                 conf=conf,
                 iou=0.45,
-                max_det=50,
+                max_det=5,
                 verbose=False,
                 device=None,
+                imgsz=960,  # 1280
             )
         except Exception as e:
             raise RuntimeError(
@@ -501,7 +492,6 @@ class ImageFaceDetect:
 
         res_iter = iter(results if isinstance(results, list) else [results])
 
-        # Для каждого ROI считаем свой порог от площади ТЕЛА (bw*bh)
         pct = max(0.0, float(face_min_component_percent)) / 100.0
 
         for roi, (rx1, ry1, rx2, ry2), body_area in zip(
@@ -514,7 +504,6 @@ class ImageFaceDetect:
             if fr is None:
                 continue
 
-            # boxes в координатах ROI → перевод в координаты полного кадра
             try:
                 f_xyxy = (
                     fr.boxes.xyxy.detach().cpu().numpy().astype(np.float32)
@@ -524,10 +513,8 @@ class ImageFaceDetect:
             except Exception:
                 f_xyxy = np.zeros((0, 4), dtype=np.float32)
 
-            thr_area_body = pct * body_area  # порог для этого тела
+            thr_area_body = pct * body_area
 
-            # Выбираем ровно одно лицо на тело — с наибольшей площадью bbox,
-            # но только если оно >= thr_area_body
             best = None  # (area, (x,y,w,h))
             for i in range(f_xyxy.shape[0]):
                 fx1f, fy1f, fx2f, fy2f = f_xyxy[i]
@@ -568,14 +555,14 @@ class ImageFaceDetect:
                     raw_mask, (fx1, fy1), (fx1 + fw, fy1 + fh), 255, thickness=-1
                 )
 
-            proc_mask = _postprocess_mask(
+            proc_mask = self._postprocess_mask(
                 raw_mask, pad_px=mask_padding_px, blur_r=mask_blur_radius
             )
             accepted_masks.append(proc_mask)
             accepted_bboxes.append(fbbox)
 
         # Удаляем возможные дубли между пересекающимися ROI (глобально)
-        accepted_bboxes, accepted_masks = _nms_by_iou_xywh(
+        accepted_bboxes, accepted_masks = self._nms_by_iou_xywh(
             accepted_bboxes, accepted_masks, iou_thr=0.6
         )
 
@@ -659,14 +646,14 @@ class ImageFaceDetect:
                 raw_mask = np.zeros((H, W), dtype=np.uint8)
                 cv2.rectangle(raw_mask, (x1, y1), (x1 + w, y1 + h), 255, thickness=-1)
 
-            proc_mask = _postprocess_mask(
+            proc_mask = self._postprocess_mask(
                 raw_mask, pad_px=mask_padding_px, blur_r=mask_blur_radius
             )
             accepted_masks.append(proc_mask)
             accepted_bboxes.append(bbox)
 
         # Глобальный NMS
-        accepted_bboxes, accepted_masks = _nms_by_iou_xywh(
+        accepted_bboxes, accepted_masks = self._nms_by_iou_xywh(
             accepted_bboxes, accepted_masks, iou_thr=0.6
         )
 
@@ -764,8 +751,9 @@ class ImageFaceDetect:
 
         found_face = len(face_bboxes_xywh) > 0
 
-        # --- конвертация масок в батч IMAGE ---
-        face_masks_batch = _masks_to_image_batch(face_masks_u8, H, W)
+        # --- конвертация масок: теперь батч MASK [B,H,W] ---
+        face_masks_batch = _masks_to_mask_batch(face_masks_u8, H, W)
+
         face_bboxes_list = [
             [int(x), int(y), int(w), int(h)] for (x, y, w, h) in face_bboxes_xywh
         ]
@@ -805,13 +793,22 @@ class ImageFaceDetect:
 
         # --- DEBUG ---
         debug = img.copy()
-        overlay = np.zeros_like(debug)
 
         if face_masks_u8:
-            mf = np.any(np.stack([m > 0 for m in face_masks_u8], axis=0), axis=0)
-            overlay[mf] = [0, 255, 0]  # зелёный
+            # мягкая альфа без порога — блюр виден
+            masks_f = [
+                m.astype(np.float32) / 255.0 for m in face_masks_u8
+            ]  # список [H,W]
+            a = np.maximum.reduce(masks_f)  # объединённая мягкая маска [H,W] 0..1
+            strength = 0.5  # насыщенность оверлея (0..1)
+            a3 = (a * strength)[..., None]  # [H,W,1]
 
-        debug = cv2.addWeighted(overlay, 0.35, debug, 0.65, 0)
+            overlay_color = np.zeros_like(debug, dtype=np.float32)
+            overlay_color[:, :, :] = (0, 255, 0)  # BGR
+
+            debug = (debug.astype(np.float32) * (1.0 - a3) + overlay_color * a3).astype(
+                np.uint8
+            )
 
         t = int(max(1, min(10, debug_bbox_thickness)))
         # входные BODY_BBOXES — жёлтые (контекст)
@@ -834,7 +831,7 @@ class ImageFaceDetect:
                 cv2.LINE_AA,
             )
 
-        # отклонённые лица — красные перечёркнутые (только те, что меньше порога)
+        # отклонённые — красные перечёркнутые
         for x, y, w_, h_ in rejected_face_bboxes:
             x2, y2 = x + w_, y + h_
             cv2.rectangle(debug, (x, y), (x2, y2), (0, 0, 255), thickness=t)
@@ -887,7 +884,7 @@ class ImageFaceDetect:
         return (
             _np_image_to_tensor(img),  # IMAGE
             face_bboxes_list,  # FACE_BBOXES
-            face_masks_batch,  # FACE_MASKS (IMAGE батч)
+            face_masks_batch,  # FACE_MASKS (MASK батч [B,H,W])
             bool(found_face),  # FOUND_FACE
             _np_image_to_tensor(debug),  # DEBUG_IMAGE
             face_crops_batch,  # FACE_CROPS (батч)

@@ -227,7 +227,7 @@ class ImageBodyDetect:
                 source=img,
                 conf=conf,
                 iou=0.45,
-                max_det=20,
+                max_det=10,
                 classes=[0],
                 verbose=False,
                 # imgsz=1280,
