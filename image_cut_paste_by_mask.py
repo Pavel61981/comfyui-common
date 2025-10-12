@@ -1,11 +1,8 @@
 from typing import Tuple
 import torch
 import torch.nn.functional as F
-from scipy.ndimage import distance_transform_edt
-import numpy as np
 
-# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ (ОБНОВЛЕННЫЕ И НОВЫЕ) =====
-
+# ===== ВСПОМОГАТЕЛЬНЫЕ ФУНКЦИИ =====
 
 def _ensure_single_image(image: torch.Tensor) -> torch.Tensor:
     """
@@ -22,7 +19,6 @@ def _ensure_single_image(image: torch.Tensor) -> torch.Tensor:
         raise RuntimeError(
             f"[image] Ожидался один кадр (batch=1), получено: {image.shape[0]}"
         )
-    # Убираем батч-измерение, чтобы работать с HxWxC
     return image.squeeze(0).to(dtype=torch.float32)
 
 
@@ -125,21 +121,6 @@ def _resize_mask_hw(mask: torch.Tensor, h: int, w: int) -> torch.Tensor:
     return x.clamp(0.0, 1.0)
 
 
-def _distance_transform_edt_outside(mask_bin: torch.Tensor) -> torch.Tensor:
-    """
-    Distance transform НАРУЖУ от маски. На выходе расстояние (px)
-    от каждого пикселя ВНЕ маски до ближайшего пикселя ВНУТРИ маски.
-    Внутри маски — нули.
-    """
-    # Инвертируем маску, чтобы distance_transform искал расстояние до белых пикселей (которые были чёрными)
-    mask_numpy = (1.0 - mask_bin.cpu().numpy()).astype(np.uint8)
-    dist_numpy = distance_transform_edt(mask_numpy, sampling=1)
-    dist_tensor = torch.from_numpy(dist_numpy).to(
-        device=mask_bin.device, dtype=torch.float32
-    )
-    return dist_tensor
-
-
 def _empty_debug_overlay(device: torch.device) -> torch.Tensor:
     """
     Возвращает «пустой» оверлей 1x1x3 (чёрный/прозрачный).
@@ -148,7 +129,7 @@ def _empty_debug_overlay(device: torch.device) -> torch.Tensor:
     return torch.zeros((1, 1, 3), dtype=torch.float32, device=device)
 
 
-# ===== НОДЫ (ОБНОВЛЕННАЯ ImageCutByMask) =====
+# ===== НОДЫ =====
 
 
 class ImageCutByMask:
@@ -165,7 +146,6 @@ class ImageCutByMask:
                 "image": ("IMAGE", {}),
                 "mask": ("MASK", {}),
                 "offset": ("INT", {"default": 16, "min": 0, "max": 4096, "step": 1}),
-                "feather_px": ("INT", {"default": 8, "min": 0, "max": 4096, "step": 1}),
                 "debug_enabled": ("BOOLEAN", {"default": False}),
                 "debug_alpha": (
                     "FLOAT",
@@ -188,36 +168,18 @@ class ImageCutByMask:
     CATEGORY = "image/mask"
     OUTPUT_NODE = True  # Превью отображает debug_overlay (или «ничего», если отключено)
 
-    def execute(self, image, mask, offset, feather_px, debug_enabled, debug_alpha):
+    def execute(self, image, mask, offset, debug_enabled, debug_alpha):
         try:
             img = _ensure_single_image(image)
             H, W, _ = img.shape
             m_soft = _ensure_mask(mask, (H, W))  # [H,W] float32, 0..1 с полутоном
             thr = 1 / 255  # или 1/255 если хотите «любой неноль»
-            m_bin = (m_soft >= thr).to(torch.float32)  # для bbox и distance transform
+            m_bin = (m_soft >= thr).to(torch.float32)  # для bbox
 
             x, y, w, h = _compute_bbox(m_bin)
 
-            # --- Новая логика размытия ---
-            # Размытие не может быть больше, чем отступ, иначе оно обрежется.
-            # Это делает поведение предсказуемым.
-            effective_feather = max(0, min(int(feather_px), int(offset)))
-
-            if effective_feather <= 0:
-                feather_full = m_soft  # сохраняем входной блюр как есть
-            else:
-                dist_out = _distance_transform_edt_outside(
-                    m_bin
-                )  # DT считаем по бинарной
-                outward_feather = (
-                    1.0 - (dist_out - 1.0) / float(effective_feather)
-                ).clamp(0.0, 1.0)
-                outward_feather = outward_feather * (
-                    1.0 - m_bin
-                )  # только снаружи «твёрдой» маски
-                feather_full = torch.maximum(
-                    m_soft, outward_feather
-                )  # <— сохраняем ваш входной градиент
+            # Маска градиента сохраняется «как есть»
+            feather_full = m_soft
 
             x_exp, y_exp, w_exp, h_exp = _expand_and_clamp_bbox(
                 (x, y, w, h), int(offset), W, H
@@ -231,9 +193,7 @@ class ImageCutByMask:
 
             # ---- Debug overlay ----
             if debug_enabled:
-                # ограничиваем альфу
-                da = float(max(0.0, min(1.0, debug_alpha)))
-                # цвет маски (1,0,0) и альфа по маске
+                da = float(max(0.0, min(1.0, debug_alpha)))  # ограничиваем альфу
                 red = torch.tensor(
                     [1.0, 0.0, 0.0], device=patch.device, dtype=patch.dtype
                 ).view(1, 1, 3)
@@ -297,10 +257,6 @@ class ImagePasteByCoords:
                     f"[patch] Каналы патча ({pc}) != каналам изображения ({C})."
                 )
 
-            # --- ИЗМЕНЕНИЕ НАЧИНАЕТСЯ ЗДЕСЬ ---
-
-            # 1. Сначала приводим маску к тензору HxW без проверки размера.
-            #    Эта логика заменяет вызов _ensure_mask с проверкой.
             if not torch.is_tensor(cropped_mask):
                 raise RuntimeError(
                     f"[cropped_mask] Ожидался torch.Tensor, получено: {type(cropped_mask)}"
@@ -321,13 +277,8 @@ class ImagePasteByCoords:
 
             mask = mask.to(dtype=torch.float32)
 
-            # 2. Теперь МАСШТАБИРУЕМ ОБА тензора (изображение и маску) под размер bbox (w, h).
-            #    Это ключевое изменение: мы не проверяем их исходные размеры друг с другом,
-            #    а приводим их к одному целевому размеру.
             patch_resized = _resize_hwc(patch, h, w, mode="bilinear")
             mask_resized = _resize_mask_hw(mask, h, w)
-
-            # --- ИЗМЕНЕНИЕ ЗАКАНЧИВАЕТСЯ ЗДЕСЬ ---
 
             x0 = max(0, x)
             y0 = max(0, y)
